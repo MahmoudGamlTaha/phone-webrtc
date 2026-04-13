@@ -510,37 +510,54 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 	return call, nil
 }
 
-// sendSIPBye sends a BYE to terminate an outbound SIP call
+// sendSIPBye sends a BYE to terminate an outbound SIP call using stored dialog fields
 func (gw *gateway) sendSIPBye(call *sipCall) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	reqURI := sip.Uri{User: call.to, Host: *sipDomain, Port: sipServerPort}
+	// Use the Contact URI from 200 OK as Request-URI (standard SIP practice)
+	reqURI := call.contactURI
+
 	fromHdr := sip.FromHeader{
-		Address: sip.Uri{User: *sipUsername, Host: *sipDomain, Port: sipServerPort},
+		Address: sip.Uri{User: call.agentExt, Host: *sipDomain, Port: sipServerPort},
 		Params:  sip.NewParams(),
 	}
-	fromHdr.Params.Add("tag", "pion-gw-bye")
+	if call.fromTag != "" {
+		fromHdr.Params.Add("tag", call.fromTag)
+	}
 
 	toHdr := sip.ToHeader{
 		Address: sip.Uri{User: call.to, Host: *sipDomain, Port: sipServerPort},
+		Params:  sip.NewParams(),
+	}
+	if call.toTag != "" {
+		toHdr.Params.Add("tag", call.toTag)
 	}
 
 	req := sip.NewRequest(sip.BYE, reqURI)
 	req.AppendHeader(&fromHdr)
 	req.AppendHeader(&toHdr)
+	req.AppendHeader(sip.NewHeader("Call-ID", call.callID))
+	req.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d BYE", call.cseqNo+1)))
+	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
+
+	log.Printf("Sending BYE: Call-ID=%s From=%s;tag=%s To=%s;tag=%s CSeq=%d",
+		call.callID, call.agentExt, call.fromTag, call.to, call.toTag, call.cseqNo+1)
 
 	res, err := gw.sipClient.Do(ctx, req)
 	if err != nil {
 		return fmt.Errorf("BYE request: %w", err)
 	}
 
-	// Handle digest auth for BYE
+	// Handle digest auth for BYE using agent credentials
 	if res.StatusCode == 401 || res.StatusCode == 407 {
 		res, err = gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
-			Username: *sipUsername,
-			Password: *sipPassword,
+			Username: call.agentExt,
+			Password: call.agentPass,
 		})
+		if err != nil {
+			return fmt.Errorf("BYE digest auth: %w", err)
+		}
 	}
 
 	log.Printf("BYE response: %d", res.StatusCode)
