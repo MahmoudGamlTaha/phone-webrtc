@@ -100,6 +100,14 @@ type sipCall struct {
 	cancelFunc context.CancelFunc
 	latched    bool // True after first RTP packet received (remoteAddr is now latched)
 
+	// SIP dialog fields for proper BYE construction
+	fromTag    string  // From tag from our INVITE
+	toTag      string  // To tag from 200 OK response
+	cseqNo     uint32  // CSeq number from INVITE
+	contactURI sip.Uri // Contact URI from 200 OK response (for BYE Request-URI)
+	agentExt   string  // Agent extension used for From header
+	agentPass  string  // Agent SIP password for digest auth on BYE
+
 	// CRM fields
 	callLogID  int64  // DB call log ID for updating status
 	agentID    int64  // Agent who made/received the call
@@ -459,13 +467,38 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 	cancel()
 
 	callID := req.CallID().String()
+
+	// Extract dialog fields for proper BYE construction
+	fromTagVal := ""
+	if ft, ok := req.From().Params.Get("tag"); ok {
+		fromTagVal = ft
+	}
+	toTagVal := ""
+	if res.To() != nil {
+		if tt, ok := res.To().Params.Get("tag"); ok {
+			toTagVal = tt
+		}
+	}
+	contactURI := sip.Uri{User: targetExtension, Host: *sipDomain, Port: sipServerPort}
+	if contact := res.Contact(); contact != nil {
+		contactURI = contact.Address
+	}
+
 	call := &sipCall{
 		callID:     callID,
-		from:       *sipUsername,
+		from:       agentExt,
 		to:         targetExtension,
 		isOutbound: true,
 		sdpAddr:    remoteAddr,
 		remoteAddr: remoteAddr, // initial target, will be updated by RTP latching
+
+		// Dialog fields for BYE
+		fromTag:    fromTagVal,
+		toTag:      toTagVal,
+		cseqNo:     req.CSeq().SeqNo,
+		contactURI: contactURI,
+		agentExt:   agentExt,
+		agentPass:  agentSIPPass,
 	}
 
 	// Store the call
