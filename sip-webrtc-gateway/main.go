@@ -823,8 +823,10 @@ func (gw *gateway) addTrackToAllPeers(track *webrtc.TrackLocalStaticRTP) {
 	defer gw.mu.RUnlock()
 
 	for _, peer := range gw.peers {
-		if _, err := peer.pc.AddTrack(track); err != nil {
-			log.Printf("Failed to add track to peer: %v", err)
+		if _, err := peer.pc.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionSendrecv,
+		}); err != nil {
+			log.Printf("Failed to add sendrecv transceiver to peer: %v", err)
 			continue
 		}
 		gw.renegotiatePeer(peer)
@@ -871,6 +873,12 @@ func (gw *gateway) renegotiatePeer(peer *peerState) {
 			peer.negotiating = false
 			peer.negotiateMu.Unlock()
 			return
+		}
+
+		// Log offer SDP to verify it contains a=sendrecv (not a=sendonly)
+		log.Printf("Offer SDP (%d bytes): %s", len(offer.SDP), offer.SDP)
+		for i, tr := range peer.pc.GetTransceivers() {
+			log.Printf("Offer transceiver[%d]: direction=%s", i, tr.Direction())
 		}
 
 		if err := peer.pc.SetLocalDescription(offer); err != nil {
@@ -1091,13 +1099,9 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer pc.Close()
 
-	// Add audio transceiver (sendrecv - browser can both send and receive audio)
-	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionSendrecv,
-	}); err != nil {
-		log.Printf("Failed to add audio transceiver: %v", err)
-		return
-	}
+	// Do NOT add a transceiver here - it creates a blank sender track that prevents
+	// AddTrack (in handleDial) from reusing the transceiver, resulting in TWO audio
+	// m-lines in the offer and one-way audio. AddTrack will create the transceiver.
 
 	// Wrap WebSocket for thread-safe writes
 	safeWS := &threadSafeWriter{Conn: ws}
@@ -1160,8 +1164,10 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Add any existing inbound SIP call audio tracks to this new peer
 	for _, call := range gw.calls {
 		if call.audioTrack != nil {
-			if _, err := pc.AddTrack(call.audioTrack); err != nil {
-				log.Printf("Failed to add existing audio track to new peer: %v", err)
+			if _, err := pc.AddTransceiverFromTrack(call.audioTrack, webrtc.RTPTransceiverInit{
+				Direction: webrtc.RTPTransceiverDirectionSendrecv,
+			}); err != nil {
+				log.Printf("Failed to add existing audio transceiver to new peer: %v", err)
 			}
 		}
 	}
@@ -1372,9 +1378,12 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 	// Start forwarding RTP from SIP to WebRTC track
 	go gw.forwardRTPToTrack(ctx, call)
 
-	// Add audio track to this peer's PeerConnection
-	if _, err := peer.pc.AddTrack(audioTrack); err != nil {
-		log.Printf("Failed to add outbound audio track: %v", err)
+	// Add audio track as sendrecv transceiver so the offer includes a=sendrecv.
+	// AddTrack would create sendonly, causing the browser to answer with recvonly (no mic sent).
+	if _, err := peer.pc.AddTransceiverFromTrack(audioTrack, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendrecv,
+	}); err != nil {
+		log.Printf("Failed to add outbound audio transceiver: %v", err)
 	}
 	gw.renegotiatePeer(peer)
 
