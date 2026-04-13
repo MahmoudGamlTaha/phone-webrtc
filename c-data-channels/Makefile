@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 The Pion community <https://pion.ly>
+# SPDX-License-Identifier: MIT
+
+c-data-channels: webrtc.so data-channels.c
+	gcc -o $@ data-channels.c ./webrtc.so
+
+webrtc.so: main.go bridge.go
+	go build -o $@ -buildmode=c-shared $^
+
+clean:
+	rm webrtc.so webrtc.h c-data-channels

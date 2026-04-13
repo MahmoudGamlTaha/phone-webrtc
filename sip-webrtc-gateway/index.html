@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SIP-to-WebRTC Gateway</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+    }
+    h1 {
+      font-size: 1.8rem;
+      margin-bottom: 0.5rem;
+      background: linear-gradient(135deg, #38bdf8, #818cf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .subtitle { color: #94a3b8; margin-bottom: 2rem; font-size: 0.9rem; }
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.5rem;
+      width: 100%;
+      max-width: 420px;
+      margin-bottom: 1.5rem;
+    }
+    .card h2 {
+      font-size: 1rem;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 1rem;
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 0.75rem;
+    }
+    .status-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: #475569; flex-shrink: 0;
+    }
+    .status-dot.connected { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+    .status-dot.disconnected { background: #ef4444; }
+    .status-dot.ringing { background: #f59e0b; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .status-label { font-size: 0.9rem; }
+    .audio-container {
+      padding: 1rem; background: #0f172a; border-radius: 8px;
+    }
+    audio { width: 100%; border-radius: 8px; outline: none; }
+    .call-info { font-size: 0.85rem; color: #64748b; margin-top: 0.5rem; }
+    .call-info span { color: #e2e8f0; }
+
+    /* Dial pad */
+    .dial-input-row {
+      display: flex; gap: 0.5rem; margin-bottom: 1rem;
+    }
+    .dial-input-row input {
+      flex: 1; padding: 0.7rem 1rem; border-radius: 8px;
+      border: 1px solid #334155; background: #0f172a; color: #e2e8f0;
+      font-size: 1.1rem; outline: none;
+    }
+    .dial-input-row input:focus { border-color: #6366f1; }
+    .dial-input-row input::placeholder { color: #475569; }
+    .btn {
+      padding: 0.6rem 1.2rem; border: none; border-radius: 8px;
+      font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: all 0.2s;
+    }
+    .btn-call {
+      background: linear-gradient(135deg, #22c55e, #16a34a); color: white;
+      min-width: 80px;
+    }
+    .btn-call:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(34,197,94,0.4); }
+    .btn-call:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
+    .btn-hangup {
+      background: #7f1d1d; color: #fca5a5; min-width: 80px;
+    }
+    .btn-hangup:hover { background: #991b1b; }
+    .btn-connect {
+      background: linear-gradient(135deg, #3b82f6, #6366f1); color: white;
+    }
+    .btn-connect:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(99,102,241,0.4); }
+    .btn-disconnect { background: #7f1d1d; color: #fca5a5; }
+
+    /* Keypad grid */
+    .keypad {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem;
+      margin-bottom: 1rem;
+    }
+    .keypad button {
+      padding: 0.8rem; border: 1px solid #334155; border-radius: 8px;
+      background: #0f172a; color: #e2e8f0; font-size: 1.2rem; cursor: pointer;
+      transition: all 0.15s;
+    }
+    .keypad button:hover { background: #1e293b; border-color: #6366f1; }
+    .keypad button:active { background: #334155; }
+
+    #logs {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.75rem; max-height: 200px; overflow-y: auto;
+      padding: 0.75rem; background: #0f172a; border-radius: 8px; line-height: 1.6;
+    }
+    #logs .log-line { color: #94a3b8; }
+    #logs .log-line.connected { color: #22c55e; }
+    #logs .log-line.disconnected { color: #ef4444; }
+    #logs .log-line.call { color: #38bdf8; }
+    #logs .log-line.error { color: #f87171; }
+  </style>
+</head>
+<body>
+  <h1>SIP-to-WebRTC Gateway</h1>
+  <p class="subtitle">Bridge SIP calls between your PBX and the browser</p>
+
+  <!-- Connection -->
+  <div class="card">
+    <h2>Connection</h2>
+    <div class="status-row">
+      <div class="status-dot" id="wsDot"></div>
+      <span class="status-label" id="wsStatus">WebSocket: Disconnected</span>
+    </div>
+    <div class="status-row">
+      <div class="status-dot" id="iceDot"></div>
+      <span class="status-label" id="iceStatus">WebRTC: Not connected</span>
+    </div>
+    <div style="margin-top:1rem;">
+      <button class="btn btn-connect" id="connectBtn" onclick="connect()">Connect</button>
+      <button class="btn btn-disconnect" id="disconnectBtn" onclick="disconnect()" style="display:none;">Disconnect</button>
+    </div>
+  </div>
+
+  <!-- Dial Pad -->
+  <div class="card">
+    <h2>Dial</h2>
+    <div class="dial-input-row">
+      <input type="text" id="extensionInput" placeholder="Extension (e.g. 7029)" disabled
+             onkeydown="if(event.key==='Enter') dial()">
+      <button class="btn btn-call" id="callBtn" onclick="dial()" disabled>Call</button>
+      <button class="btn btn-hangup" id="hangupBtn" onclick="hangup()" style="display:none;">Hangup</button>
+    </div>
+    <div class="keypad">
+      <button onclick="appendDigit('1')">1</button>
+      <button onclick="appendDigit('2')">2</button>
+      <button onclick="appendDigit('3')">3</button>
+      <button onclick="appendDigit('4')">4</button>
+      <button onclick="appendDigit('5')">5</button>
+      <button onclick="appendDigit('6')">6</button>
+      <button onclick="appendDigit('7')">7</button>
+      <button onclick="appendDigit('8')">8</button>
+      <button onclick="appendDigit('9')">9</button>
+      <button onclick="appendDigit('*')">*</button>
+      <button onclick="appendDigit('0')">0</button>
+      <button onclick="appendDigit('#')">#</button>
+    </div>
+  </div>
+
+  <!-- Active Call -->
+  <div class="card">
+    <h2>Active Call</h2>
+    <div class="status-row">
+      <div class="status-dot" id="callDot"></div>
+      <span class="status-label" id="callStatus">No active call</span>
+    </div>
+    <div class="call-info" id="callInfo"></div>
+    <div class="audio-container" style="margin-top:1rem;">
+      <audio id="remoteAudio" autoplay controls></audio>
+    </div>
+  </div>
+
+  <!-- Logs -->
+  <div class="card">
+    <h2>Logs</h2>
+    <div id="logs"></div>
+  </div>
+
+  <script>
+    let pc = null;
+    let ws = null;
+    let localStream = null;
+    let inCall = false;
+
+    function log(msg, cls) {
+      const el = document.getElementById('logs');
+      const line = document.createElement('div');
+      line.className = 'log-line' + (cls ? ' ' + cls : '');
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      el.appendChild(line);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function setStatus(dotId, statusId, dotClass, text) {
+      document.getElementById(dotId).className = 'status-dot ' + (dotClass || '');
+      document.getElementById(statusId).textContent = text;
+    }
+
+    function setCallActive(active, info) {
+      inCall = active;
+      document.getElementById('callBtn').style.display = active ? 'none' : '';
+      document.getElementById('hangupBtn').style.display = active ? '' : 'none';
+      if (active) {
+        setStatus('callDot', 'callStatus', 'connected', 'In call');
+        document.getElementById('callInfo').innerHTML = info || '';
+      } else {
+        setStatus('callDot', 'callStatus', '', 'No active call');
+        document.getElementById('callInfo').innerHTML = '';
+      }
+    }
+
+    function appendDigit(d) {
+      const input = document.getElementById('extensionInput');
+      input.value += d;
+      input.focus();
+    }
+
+    function dial() {
+      const ext = document.getElementById('extensionInput').value.trim();
+      if (!ext) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return log('Not connected', 'error');
+
+      log('Dialing ' + ext + '...', 'call');
+      ws.send(JSON.stringify({ event: 'dial', data: ext }));
+    }
+
+    function hangup() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      log('Hanging up...', 'disconnected');
+      ws.send(JSON.stringify({ event: 'hangup', data: '' }));
+      setCallActive(false);
+    }
+
+    function connect() {
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//13.53.39.195:8080/ws`;
+      log('Connecting to ' + wsUrl);
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        setStatus('wsDot', 'wsStatus', 'connected', 'WebSocket: Connected');
+        log('WebSocket connected', 'connected');
+        document.getElementById('connectBtn').style.display = 'none';
+        document.getElementById('disconnectBtn').style.display = '';
+        document.getElementById('callBtn').disabled = false;
+        document.getElementById('extensionInput').disabled = false;
+      };
+
+      ws.onclose = () => {
+        setStatus('wsDot', 'wsStatus', 'disconnected', 'WebSocket: Disconnected');
+        setStatus('iceDot', 'iceStatus', '', 'WebRTC: Not connected');
+        log('WebSocket disconnected', 'disconnected');
+        document.getElementById('connectBtn').style.display = '';
+        document.getElementById('disconnectBtn').style.display = 'none';
+        document.getElementById('callBtn').disabled = true;
+        document.getElementById('extensionInput').disabled = true;
+        setCallActive(false);
+        if (pc) { pc.close(); pc = null; }
+        if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+      };
+
+      ws.onerror = () => log('WebSocket error', 'error');
+
+      // Check if getUserMedia is available (requires HTTPS or localhost)
+      const hasMic = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+      if (!hasMic) {
+        log('WARNING: Microphone not available - page must be served over HTTPS for mic access', 'error');
+      }
+
+      // Create PeerConnection
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+
+      // Get local audio (microphone) for sendrecv
+      const micPromise = hasMic
+        ? navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+        : Promise.resolve(null);
+
+      micPromise.then(stream => {
+          if (stream) {
+            localStream = stream;
+            log('Got microphone access', 'connected');
+            // Add local audio track
+            stream.getTracks().forEach(track => pc.addTrack(track, stream));
+          } else {
+            log('No microphone - receive only mode', 'error');
+            pc.addTransceiver('audio', { direction: 'recvonly' });
+          }
+
+          pc.oniceconnectionstatechange = () => {
+            const state = pc.iceConnectionState;
+            log('ICE state: ' + state, state === 'connected' ? 'connected' : state === 'disconnected' ? 'disconnected' : '');
+            if (state === 'connected') {
+              setStatus('iceDot', 'iceStatus', 'connected', 'WebRTC: Connected');
+            } else if (state === 'disconnected' || state === 'failed') {
+              setStatus('iceDot', 'iceStatus', 'disconnected', 'WebRTC: ' + state);
+            } else {
+              setStatus('iceDot', 'iceStatus', '', 'WebRTC: ' + state);
+            }
+          };
+
+          pc.ontrack = (event) => {
+            log('Got remote audio track', 'call');
+            document.getElementById('remoteAudio').srcObject = event.streams[0];
+          };
+
+          // Send ICE candidates to server
+          pc.onicecandidate = (event) => {
+            if (!event.candidate) return;
+            ws.send(JSON.stringify({
+              event: 'candidate',
+              data: JSON.stringify(event.candidate)
+            }));
+          };
+
+          // Handle messages from server
+          ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            if (!msg) return;
+
+            switch (msg.event) {
+              case 'offer':
+                const offer = JSON.parse(msg.data);
+                if (!offer) return log('Failed to parse offer', 'error');
+                log('Received offer from server', 'call');
+                pc.setRemoteDescription(offer)
+                  .then(() => pc.createAnswer())
+                  .then(answer => {
+                    pc.setLocalDescription(answer);
+                    ws.send(JSON.stringify({ event: 'answer', data: JSON.stringify(answer) }));
+                    log('Sent answer to server', 'call');
+                  })
+                  .catch(err => log('SDP error: ' + err.message, 'error'));
+                return;
+
+              case 'candidate':
+                const candidate = JSON.parse(msg.data);
+                if (!candidate) return;
+                pc.addIceCandidate(candidate).catch(err => log('ICE candidate error: ' + err.message, 'error'));
+                return;
+
+              case 'call-started':
+                setCallActive(true, 'With: <span>' + msg.data + '</span>');
+                log('Call started: ' + msg.data, 'call');
+                return;
+
+              case 'call-ended':
+                setCallActive(false);
+                log('Call ended', 'disconnected');
+                return;
+
+              case 'dial-error':
+                log('Dial error: ' + msg.data, 'error');
+                return;
+            }
+          };
+        })
+        .catch(err => {
+          log('Microphone access denied: ' + err.message, 'error');
+          // Continue without mic (recvonly fallback)
+          pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+          pc.addTransceiver('audio', { direction: 'recvonly' });
+
+          pc.oniceconnectionstatechange = () => {
+            const state = pc.iceConnectionState;
+            log('ICE state: ' + state);
+            if (state === 'connected') setStatus('iceDot', 'iceStatus', 'connected', 'WebRTC: Connected (recvonly)');
+          };
+          pc.ontrack = (event) => {
+            document.getElementById('remoteAudio').srcObject = event.streams[0];
+          };
+          pc.onicecandidate = (event) => {
+            if (!event.candidate) return;
+            ws.send(JSON.stringify({ event: 'candidate', data: JSON.stringify(event.candidate) }));
+          };
+          ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+            if (!msg) return;
+            if (msg.event === 'offer') {
+              const offer = JSON.parse(msg.data);
+              pc.setRemoteDescription(offer)
+                .then(() => pc.createAnswer())
+                .then(answer => {
+                  pc.setLocalDescription(answer);
+                  ws.send(JSON.stringify({ event: 'answer', data: JSON.stringify(answer) }));
+                })
+                .catch(err => log('SDP error: ' + err.message, 'error'));
+            } else if (msg.event === 'candidate') {
+              pc.addIceCandidate(JSON.parse(msg.data)).catch(() => {});
+            } else if (msg.event === 'call-started') {
+              setCallActive(true, 'With: <span>' + msg.data + '</span>');
+            } else if (msg.event === 'call-ended') {
+              setCallActive(false);
+            } else if (msg.event === 'dial-error') {
+              log('Dial error: ' + msg.data, 'error');
+            }
+          };
+        });
+    }
+
+    function disconnect() {
+      if (inCall) hangup();
+      if (pc) { pc.close(); pc = null; }
+      if (ws) { ws.close(); ws = null; }
+      if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+      setCallActive(false);
+    }
+  </script>
+</body>
+</html>
