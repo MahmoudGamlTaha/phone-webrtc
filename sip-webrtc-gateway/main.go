@@ -1422,6 +1422,9 @@ func (gw *gateway) handleHangup(peer *peerState) {
 		}
 	}
 
+	// Notify browser that call ended
+	peer.ws.WriteJSON(wsMessage{Event: "call-ended", Data: "hangup"})
+
 	gw.endCall(call.callID)
 }
 
