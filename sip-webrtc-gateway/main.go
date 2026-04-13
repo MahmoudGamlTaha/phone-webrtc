@@ -56,7 +56,8 @@ import (
 var (
 	httpPort = flag.Int("http-port", 8080, "Port for HTTP/WebSocket server")
 	publicIP = flag.String("public-ip", "", "Public IP for SDP (auto-detected if empty)")
-	dbPath   = flag.String("db", "root:@tcp(127.0.0.1:3306)/mini_call_crm?parseTime=true", "MySQL DSN (user:password@tcp(host:port)/dbname?parseTime=true)")
+	//	dbPath   = flag.String("db", "root:@tcp(127.0.0.1:3306)/mini_call_crm?parseTime=true", "MySQL DSN (user:password@tcp(host:port)/dbname?parseTime=true)")
+	dbPath = flag.String("db", "mini-crm:ZtRlUn3@p7sbo!0l@tcp(62.171.174.59:3306)/mini_crm?parseTime=true", "MySQL DSN (user:password@tcp(host:port)/dbname?parseTime=true)")
 
 	// SIP client flags (for registering with PBX and making outbound calls)
 	sipServerAddr = flag.String("sip-server", "173.199.70.125:5666", "SIP server address (host:port), e.g. 173.199.70.125:5668")
