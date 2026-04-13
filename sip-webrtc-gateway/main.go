@@ -1195,6 +1195,13 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			if err := pc.SetRemoteDescription(answer); err != nil {
 				log.Printf("Failed to set remote description: %v", err)
 			} else {
+				// Log SDP answer to verify browser is sending audio (look for SSRC lines)
+				log.Printf("SDP answer from browser (%d bytes): %s", len(answer.SDP), answer.SDP)
+				for i, tr := range pc.GetTransceivers() {
+					log.Printf("Transceiver[%d]: direction=%s senderTrack=%v receiverTrack=%v",
+						i, tr.Direction(), tr.Sender() != nil && tr.Sender().Track() != nil,
+						tr.Receiver() != nil && tr.Receiver().Track() != nil)
+				}
 				log.Printf("WebRTC answer set successfully, signaling state: %s", pc.SignalingState())
 				// Clear negotiating flag and trigger pending renegotiation if needed
 				peer.negotiateMu.Lock()
