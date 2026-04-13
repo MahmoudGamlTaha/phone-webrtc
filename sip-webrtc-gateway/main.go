@@ -1167,8 +1167,10 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	gw.mu.Unlock()
 
-	// Create initial offer and send to browser
-	gw.renegotiatePeer(peer)
+	// Do NOT send initial offer here - wait until a call is placed.
+	// Sending an offer before the browser has mic ready causes one-way audio,
+	// and the subsequent renegotiation on dial may not properly re-establish the track.
+	// The first (and only) offer will be sent from handleDial after the SIP call is set up.
 
 	// Main WebSocket read loop
 	for {
