@@ -867,6 +867,23 @@ func (gw *gateway) broadcastToPeers(msg wsMessage) {
 	}
 }
 
+// corsMiddleware adds CORS headers and handles preflight OPTIONS requests
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // startHTTPServer serves the web UI and handles WebSocket connections
 func (gw *gateway) startHTTPServer() {
 	mux := http.NewServeMux()
@@ -898,13 +915,16 @@ func (gw *gateway) startHTTPServer() {
 		http.ServeFile(w, r, "index.html")
 	})
 
+	// Wrap mux with CORS middleware
+	corsHandler := corsMiddleware(mux)
+
 	addr := fmt.Sprintf(":%d", *httpPort)
 
 	if *enableTLS {
 		// Use provided cert/key or auto-generate self-signed cert
 		if *tlsCert != "" && *tlsKey != "" {
 			log.Printf("Starting HTTPS server on %s (using provided cert)", addr)
-			if err := http.ListenAndServeTLS(addr, *tlsCert, *tlsKey, mux); err != nil {
+			if err := http.ListenAndServeTLS(addr, *tlsCert, *tlsKey, corsHandler); err != nil {
 				log.Fatalf("HTTPS server failed: %v", err)
 			}
 		} else {
@@ -918,13 +938,13 @@ func (gw *gateway) startHTTPServer() {
 				log.Printf("Self-signed cert generated: %s, %s", certFile, keyFile)
 			}
 			log.Printf("Starting HTTPS server on %s (self-signed cert - accept browser warning!)", addr)
-			if err := http.ListenAndServeTLS(addr, certFile, keyFile, mux); err != nil {
+			if err := http.ListenAndServeTLS(addr, certFile, keyFile, corsHandler); err != nil {
 				log.Fatalf("HTTPS server failed: %v", err)
 			}
 		}
 	} else {
 		log.Printf("Starting HTTP server on %s (use -tls for HTTPS/browser mic access)", addr)
-		if err := http.ListenAndServe(addr, mux); err != nil {
+		if err := http.ListenAndServe(addr, corsHandler); err != nil {
 			log.Fatalf("HTTP server failed: %v", err)
 		}
 	}
