@@ -19,7 +19,7 @@ export function clearToken() {
 async function api(path, options = {}) {
   const headers = { 'Content-Type': 'application/json', ...options.headers };
   if (token) headers['Authorization'] = `Bearer ${token}`;
-  const res = await fetch(`http://localhost:8080${API_BASE}${path}`, { ...options, headers });
+  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
   if (res.status === 401) {
     clearToken();
     window.location.reload();

@@ -6,6 +6,7 @@ let localStream = null;
 let onEvent = null;
 let callActive = false;
 let iceCandidateQueue = [];
+let micPromise = null; // Deduplicates getUserMedia calls
 
 export function setEventHandler(handler) {
   onEvent = handler;
@@ -21,10 +22,9 @@ export function connect() {
     return;
   }
 
-  // Always connect WebSocket to the Go backend on port 8080
-  // (Vite dev server runs on a different port and doesn't proxy WS well)
+  // Use same host as the page (works for both HTTP and HTTPS)
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsHost = '13.53.39.195:8080';
+  const wsHost = window.location.host;
   const wsUrl = `${protocol}//${wsHost}/ws`;
 
   ws = new WebSocket(wsUrl);
@@ -57,31 +57,19 @@ export function connect() {
     }
   };
 
-  // Create WebRTC PeerConnection (PCMU only)
+  // Create WebRTC PeerConnection - backend is the offerer, we are the answerer
   pc = new RTCPeerConnection({
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-    codecPreferences: ['audio/PCMU'],
   });
 
-  // Get microphone
-  const hasMic = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
-  if (hasMic) {
-    navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-      .then(stream => {
-        localStream = stream;
-        stream.getTracks().forEach(track => pc.addTrack(track, stream));
-        emit('mic-ready', '');
-        createOffer();
-      })
-      .catch(err => {
-        emit('mic-error', err.message);
-        pc.addTransceiver('audio', { direction: 'recvonly' });
-        createOffer();
-      });
-  } else {
-    pc.addTransceiver('audio', { direction: 'recvonly' });
-    createOffer();
-  }
+  // Do NOT addTransceiver here - ensureMicStream uses addTrack instead, which
+  // creates a transceiver with our mic track already attached. When the backend's
+  // offer arrives, setRemoteDescription matches this transceiver to the m-line,
+  // and createAnswer includes our mic SSRC. Pre-creating with addTransceiver
+  // (no track) caused m-line mismatch → one-way audio.
+
+  // Request mic early so it's ready when the offer arrives
+  ensureMicStream();
 
   pc.onicecandidate = (e) => {
     if (e.candidate) {
@@ -103,14 +91,33 @@ export function connect() {
   };
 }
 
-async function createOffer() {
-  try {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    sendWS('offer', JSON.stringify(pc.localDescription));
-  } catch (e) {
-    emit('offer-error', e.message);
-  }
+// ensureMicStream requests microphone and adds the track to the PeerConnection.
+// Must be called BEFORE setRemoteDescription so the track is on the transceiver
+// when createAnswer runs. This is the standard WebRTC answerer pattern.
+async function ensureMicStream() {
+  if (localStream) return true;
+  if (micPromise) return micPromise;
+  micPromise = (async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      localStream = stream;
+      const track = stream.getAudioTracks()[0];
+      if (track && pc) {
+        // addTrack creates an audio transceiver with our mic track.
+        // When setRemoteDescription processes the offer, it will match this
+        // transceiver to the offer's audio m-line by kind.
+        pc.addTrack(track, stream);
+        console.log('ensureMicStream: mic track added via addTrack, track id=', track.id);
+      }
+      emit('mic-ready', '');
+      return true;
+    } catch (err) {
+      emit('mic-error', err.message);
+      micPromise = null;
+      return false;
+    }
+  })();
+  return micPromise;
 }
 
 async function drainIceCandidates() {
@@ -127,15 +134,35 @@ async function drainIceCandidates() {
 function handleSignaling(msg) {
   switch (msg.event) {
     case 'offer':
-      pc.setRemoteDescription(JSON.parse(msg.data))
+      // Standard WebRTC answerer pattern:
+      // 1) ensureMicStream - adds mic track via addTrack BEFORE setRemoteDescription
+      // 2) setRemoteDescription - matches our audio transceiver to offer's m-line
+      // 3) createAnswer - includes our mic SSRC in the answer
+      ensureMicStream()
         .then(() => {
-          // Drain buffered ICE candidates
-          return drainIceCandidates();
+          console.log('offer handler: mic ready, transceivers=', pc.getTransceivers().length,
+            pc.getTransceivers().map(t => ({ dir: t.direction, track: t.sender?.track?.kind })));
+          return pc.setRemoteDescription(JSON.parse(msg.data));
         })
+        .then(() => drainIceCandidates())
         .then(() => pc.createAnswer())
-        .then(answer => pc.setLocalDescription(answer))
-        .then(() => sendWS('answer', JSON.stringify(pc.localDescription)))
-        .catch(e => emit('answer-error', e.message));
+        .then(answer => {
+          const hasSSRC = answer.sdp && answer.sdp.includes('ssrc');
+          console.log('createAnswer: hasSSRC=', hasSSRC,
+            'transceivers=', pc.getTransceivers().map(t => ({ dir: t.direction, track: t.sender?.track?.kind })));
+          if (!hasSSRC) {
+            console.error('WARNING: answer SDP has no SSRC - mic audio will NOT be sent!');
+          }
+          return pc.setLocalDescription(answer);
+        })
+        .then(() => {
+          console.log('SDP answer sent, type:', pc.localDescription.type);
+          sendWS('answer', JSON.stringify(pc.localDescription));
+        })
+        .catch(e => {
+          console.error('offer handling error:', e);
+          emit('answer-error', e.message);
+        });
       break;
     case 'answer':
       pc.setRemoteDescription(JSON.parse(msg.data))
@@ -175,25 +202,37 @@ function handleSignaling(msg) {
 }
 
 function sendWS(event, data) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (!ws) {
+    console.error(`sendWS('${event}'): WebSocket is null - not connected`);
+    return;
+  }
+  if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ event, data }));
+  } else if (ws.readyState === WebSocket.CONNECTING) {
+    console.warn(`sendWS('${event}'): WebSocket still connecting, retrying in 500ms`);
+    setTimeout(() => sendWS(event, data), 500);
+  } else {
+    console.error(`sendWS('${event}'): WebSocket closed (state=${ws.readyState}), reconnecting`);
+    connect();
+    setTimeout(() => sendWS(event, data), 1000);
   }
 }
 
-export function dial(extension, customerID) {
+export async function dial(extension, customerID) {
   const data = customerID ? `${extension}:${customerID}` : extension;
   callActive = true;
   emit('dialing', extension);
+  // Ensure mic is available before dialing
+  await ensureMicStream();
+  console.log(`sip.dial: sending dial event for ${extension}, ws state=${ws ? ws.readyState : 'null'}`);
   sendWS('dial', data);
 }
 
 export function hangup() {
   sendWS('hangup', '');
   callActive = false;
-  if (localStream) {
-    localStream.getTracks().forEach(t => t.stop());
-    localStream = null;
-  }
+  // Don't stop localStream on hangup - keep mic for next call
+  // Stream will be stopped on disconnect()
 }
 
 export function isCallActive() {
@@ -202,6 +241,10 @@ export function isCallActive() {
 
 export function disconnect() {
   hangup();
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+  }
   if (pc) { pc.close(); pc = null; }
   if (ws) {
     // Only close if actually open, avoid closing during CONNECTING
@@ -210,5 +253,6 @@ export function disconnect() {
     }
     ws = null;
   }
+  micPromise = null;
   iceCandidateQueue = [];
 }

@@ -357,6 +357,7 @@ function Dashboard({ agent, onLogout }) {
       if (event === 'dialing') { setCallStatus('dialing'); setCurrentExt(data) }
       if (event === 'call-started') { setCallStatus('connected'); setCurrentExt(data); loadData() }
       if (event === 'call-ended' || event === 'dial-error') { setCallStatus('idle'); setCurrentExt(''); loadData() }
+      if (event === 'mic-error') console.error('Mic access failed:', data, '- HTTPS may be required')
     })
     sip.connect()
   }, [loadData])
