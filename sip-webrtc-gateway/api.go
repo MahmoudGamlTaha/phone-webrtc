@@ -139,6 +139,55 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func handleRegister(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		DisplayName string `json:"displayName"`
+		Extension   string `json:"extension"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if req.Username == "" || req.Password == "" || req.DisplayName == "" || req.Extension == "" {
+		writeError(w, http.StatusBadRequest, "all fields are required")
+		return
+	}
+	if len(req.Password) < 6 {
+		writeError(w, http.StatusBadRequest, "password must be at least 6 characters")
+		return
+	}
+
+	// Check if username already exists
+	if _, err := getAgentByUsername(req.Username); err == nil {
+		writeError(w, http.StatusConflict, "username already taken")
+		return
+	}
+
+	// Create agent (password stored as-is for now, same as login)
+	agentID, err := createAgent(req.Username, req.Password, req.DisplayName, req.Extension)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create account")
+		return
+	}
+
+	// Auto-login: generate token
+	token, err := generateToken(agentID, req.Username)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "token generation failed")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"token":       token,
+		"agentId":     agentID,
+		"username":    req.Username,
+		"displayName": req.DisplayName,
+		"extension":   req.Extension,
+	})
+}
+
 func handleGetProfile(w http.ResponseWriter, r *http.Request) {
 	agentID, _ := strconv.ParseInt(r.Header.Get("X-Agent-ID"), 10, 64)
 	agent, err := getAgentByID(agentID)
@@ -378,6 +427,7 @@ func handleDashboardStats(w http.ResponseWriter, r *http.Request) {
 func registerAPIRoutes(mux *http.ServeMux) {
 	// Auth (no token required)
 	mux.HandleFunc("/api/login", handleLogin)
+	mux.HandleFunc("/api/register", handleRegister)
 
 	// Profile
 	mux.HandleFunc("/api/profile", authMiddleware(handleGetProfile))

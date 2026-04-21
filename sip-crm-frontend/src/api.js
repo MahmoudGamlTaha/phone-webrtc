@@ -33,6 +33,8 @@ async function api(path, options = {}) {
 export const auth = {
   login: (username, password) =>
     api('/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
+  register: (data) =>
+    api('/register', { method: 'POST', body: JSON.stringify(data) }),
   profile: () => api('/profile'),
 };
 

@@ -7,6 +7,8 @@ let onEvent = null;
 let callActive = false;
 let iceCandidateQueue = [];
 let micPromise = null; // Deduplicates getUserMedia calls
+let ringbackCtx = null; // Web Audio API context for ringback tone
+let ringbackOsc = null; // Oscillator node for ringback tone
 
 export function setEventHandler(handler) {
   onEvent = handler;
@@ -184,20 +186,84 @@ function handleSignaling(msg) {
     case 'auth-error':
       emit('auth-error', msg.data);
       break;
+    case 'ringing':
+      startRingback();
+      emit('ringing', msg.data);
+      break;
     case 'call-started':
       callActive = true;
+      stopRingback();
       emit('call-started', msg.data);
       break;
     case 'call-ended':
       callActive = false;
+      stopRingback();
       emit('call-ended', msg.data);
       break;
     case 'dial-error':
       callActive = false;
+      stopRingback();
       emit('dial-error', msg.data);
       break;
     default:
       emit(msg.event, msg.data);
+  }
+}
+
+// Ringback tone using Web Audio API (standard US ringback: 440+480Hz, 2s on / 4s off)
+function startRingback() {
+  if (ringbackCtx) return; // Already playing
+  try {
+    ringbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const gain = ringbackCtx.createGain();
+    gain.gain.value = 0.15; // Low volume to not blast the user
+    gain.connect(ringbackCtx.destination);
+
+    const osc1 = ringbackCtx.createOscillator();
+    osc1.frequency.value = 440;
+    osc1.type = 'sine';
+    osc1.connect(gain);
+    osc1.start();
+
+    const osc2 = ringbackCtx.createOscillator();
+    osc2.frequency.value = 480;
+    osc2.type = 'sine';
+    osc2.connect(gain);
+    osc2.start();
+
+    // Cadence: 2s on, 4s off (modulate gain)
+    ringbackOsc = { osc1, osc2, gain };
+    ringbackCadence(gain);
+  } catch (e) {
+    console.error('Ringback tone error:', e);
+  }
+}
+
+function ringbackCadence(gain) {
+  if (!ringbackCtx) return;
+  const t = ringbackCtx.currentTime;
+  // 2s on, 4s off = 6s cycle
+  gain.gain.setValueAtTime(0.15, t);
+  gain.gain.setValueAtTime(0, t + 2);
+  gain.gain.setValueAtTime(0.15, t + 6);
+  gain.gain.setValueAtTime(0, t + 8);
+  gain.gain.setValueAtTime(0.15, t + 12);
+  gain.gain.setValueAtTime(0, t + 14);
+  gain.gain.setValueAtTime(0.15, t + 18);
+  gain.gain.setValueAtTime(0, t + 20);
+}
+
+function stopRingback() {
+  if (ringbackOsc) {
+    try {
+      ringbackOsc.osc1.stop();
+      ringbackOsc.osc2.stop();
+    } catch (e) { /* already stopped */ }
+    ringbackOsc = null;
+  }
+  if (ringbackCtx) {
+    ringbackCtx.close().catch(() => {});
+    ringbackCtx = null;
   }
 }
 
@@ -231,6 +297,7 @@ export async function dial(extension, customerID) {
 export function hangup() {
   sendWS('hangup', '');
   callActive = false;
+  stopRingback();
   // Don't stop localStream on hangup - keep mic for next call
   // Stream will be stopped on disconnect()
 }
@@ -241,6 +308,7 @@ export function isCallActive() {
 
 export function disconnect() {
   hangup();
+  stopRingback();
   if (localStream) {
     localStream.getTracks().forEach(t => t.stop());
     localStream = null;

@@ -99,6 +99,7 @@ type sipCall struct {
 	isOutbound bool
 	cancelFunc context.CancelFunc
 	latched    bool // True after first RTP packet received (remoteAddr is now latched)
+	ringing    bool // True after 180 Ringing received
 
 	// SIP dialog fields for proper BYE construction
 	fromTag    string  // From tag from our INVITE
@@ -120,9 +121,10 @@ type peerState struct {
 	ws                 *threadSafeWriter
 	pc                 *webrtc.PeerConnection
 	call               *sipCall
-	negotiateMu        sync.Mutex // Prevents concurrent renegotiation
-	negotiating        bool       // True when an offer/answer exchange is in progress
-	pendingRenegotiate bool       // True if renegotiation was requested while already negotiating
+	callReady          chan struct{} // Signaled when a SIP call is associated with this peer (replaces busy-wait)
+	negotiateMu        sync.Mutex    // Prevents concurrent renegotiation
+	negotiating        bool          // True when an offer/answer exchange is in progress
+	pendingRenegotiate bool          // True if renegotiation was requested while already negotiating
 
 	// CRM fields
 	agentID      int64  // Logged-in agent ID
@@ -374,7 +376,7 @@ func (gw *gateway) registerSIP() error {
 }
 
 // dialSIP sends an INVITE to the PBX for a target extension using the given agent credentials
-func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, agentSIPPass string) (*sipCall, error) {
+func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRTPPort int, agentExt, agentSIPPass string) (*sipCall, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 
 	// Build SDP offer for the INVITE
@@ -410,26 +412,53 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 	req.AppendHeader(&contentTypeHeaderSDP)
 	req.SetBody(sdpBytes)
 
-	// Send INVITE
-	res, err := gw.sipClient.Do(ctx, req)
+	// Use Transaction-level approach to capture 180 Ringing provisional responses
+	tx, err := gw.sipClient.TransactionRequest(ctx, req, sipgo.ClientRequestAddVia)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("INVITE request: %w", err)
+		return nil, fmt.Errorf("INVITE transaction request: %w", err)
 	}
 
-	// Handle 401/407 digest auth using agent's credentials
-	if res.StatusCode == 401 || res.StatusCode == 407 {
-		res, err = gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
-			Username: agentExt,
-			Password: agentSIPPass,
-		})
-		if err != nil {
+	// Read provisional and final responses
+	var res *sip.Response
+	for {
+		select {
+		case <-ctx.Done():
 			cancel()
-			return nil, fmt.Errorf("INVITE digest auth: %w", err)
+			return nil, fmt.Errorf("INVITE timeout")
+		case txRes, ok := <-tx.Responses():
+			if !ok {
+				cancel()
+				return nil, fmt.Errorf("INVITE transaction closed without response")
+			}
+			res = txRes
+
+			// Handle 180 Ringing - notify frontend
+			if res.StatusCode == 180 {
+				log.Printf("SIP 180 Ringing received for call to %s", targetExtension)
+				gw.notifyRinging(ws)
+				continue
+			}
+
+			// Handle 401/407 digest auth
+			if res.StatusCode == 401 || res.StatusCode == 407 {
+				res, err = gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
+					Username: agentExt,
+					Password: agentSIPPass,
+				})
+				if err != nil {
+					cancel()
+					return nil, fmt.Errorf("INVITE digest auth: %w", err)
+				}
+			}
+
+			// Any final response (2xx, 3xx, 4xx, 5xx, 6xx) - stop reading
+			if res.StatusCode >= 200 {
+				break
+			}
 		}
 	}
 
-	// sipgo Do() skips provisional responses (180 Ringing) and returns the final response
 	if res.StatusCode != 200 {
 		cancel()
 		return nil, fmt.Errorf("INVITE failed with status %d", res.StatusCode)
@@ -741,8 +770,10 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 		}
 
 		if _, err := call.audioTrack.Write(buff[:n]); err != nil {
-			log.Printf("Audio track write error for call %s: %v", call.callID, err)
-			return
+			// Don't return on single write error - WebRTC track may recover
+			if pktCount%100 != 0 {
+				log.Printf("Audio track write error for call %s: %v", call.callID, err)
+			}
 		}
 	}
 }
@@ -772,10 +803,12 @@ func forwardTrackToRTP(track *webrtc.TrackRemote, call *sipCall) {
 
 		if dest != nil {
 			if _, err := call.rtpConn.WriteToUDP(buff[:n], dest); err != nil {
-				log.Printf("RTP write error: %v", err)
-				return
+				// Don't return on single write error - network may recover
+				if pktCount%100 != 0 {
+					log.Printf("RTP write error: %v", err)
+				}
 			}
-		} else {
+		} else if pktCount <= 3 {
 			log.Printf("WebRTC→SIP: dropping pkt #%d, no remote address (no SDP addr, not latched yet)", pktCount)
 		}
 	}
@@ -815,6 +848,11 @@ func (gw *gateway) endCall(callID string) {
 	}
 
 	log.Printf("SIP call ended: %s", callID)
+}
+
+// notifyRinging sends a ringing event to the browser peer
+func (gw *gateway) notifyRinging(ws *threadSafeWriter) {
+	ws.WriteJSON(wsMessage{Event: "ringing", Data: ""})
 }
 
 // addTrackToAllPeers adds an audio track to every connected WebRTC PeerConnection
@@ -1144,31 +1182,8 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 
-	// Handle incoming audio track from browser (for outbound calls)
-	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		log.Printf("Got remote audio track from browser: Kind=%s, ID=%s", track.Kind(), track.ID())
-
-		// Wait until this peer has an active outbound SIP call with a remote RTP address
-		for {
-			gw.mu.RLock()
-			peer, ok := gw.peers[safeWS]
-			if !ok {
-				gw.mu.RUnlock()
-				return
-			}
-			if peer.call != nil && peer.call.rtpConn != nil {
-				call := peer.call
-				gw.mu.RUnlock()
-				forwardTrackToRTP(track, call)
-				return
-			}
-			gw.mu.RUnlock()
-			time.Sleep(100 * time.Millisecond)
-		}
-	})
-
-	// Register the peer
-	peer := &peerState{ws: safeWS, pc: pc}
+	// Register the peer BEFORE setting OnTrack so the handler can reference it
+	peer := &peerState{ws: safeWS, pc: pc, callReady: make(chan struct{}, 1)}
 	gw.mu.Lock()
 	gw.peers[safeWS] = peer
 
@@ -1184,6 +1199,32 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	gw.mu.Unlock()
+
+	// Handle incoming audio track from browser (for outbound calls)
+	// Uses channel signal instead of busy-wait for lower latency and CPU usage
+	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		log.Printf("Got remote audio track from browser: Kind=%s, ID=%s", track.Kind(), track.ID())
+
+		for {
+			select {
+			case <-peer.callReady:
+				gw.mu.RLock()
+				call := peer.call
+				gw.mu.RUnlock()
+				if call != nil && call.rtpConn != nil {
+					forwardTrackToRTP(track, call)
+					return
+				}
+			case <-time.After(30 * time.Second):
+				gw.mu.RLock()
+				_, ok := gw.peers[safeWS]
+				gw.mu.RUnlock()
+				if !ok {
+					return
+				}
+			}
+		}
+	})
 
 	// Send initial offer to browser so ICE can establish.
 	// The transceiver has a generated track (placeholder) - handleDial will
@@ -1327,7 +1368,7 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 	}
 
 	// Send INVITE to PBX using agent's SIP credentials
-	call, err := gw.dialSIP(extension, rtpPort, peer.agentExt, peer.agentSIPPass)
+	call, err := gw.dialSIP(ws, extension, rtpPort, peer.agentExt, peer.agentSIPPass)
 	if err != nil {
 		rtpConn.Close()
 		ws.WriteJSON(wsMessage{Event: "dial-error", Data: fmt.Sprintf("SIP INVITE failed: %v", err)})
@@ -1422,10 +1463,15 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 		}
 	}
 
-	// Associate call with peer
+	// Associate call with peer and signal the OnTrack handler
 	gw.mu.Lock()
 	peer.call = call
 	gw.mu.Unlock()
+	select {
+	case peer.callReady <- struct{}{}:
+	default:
+		// Channel already has a signal, no need to block
+	}
 
 	ws.WriteJSON(wsMessage{Event: "call-started", Data: extension})
 	log.Printf("Outbound call to %s established for agent %d", extension, peer.agentID)

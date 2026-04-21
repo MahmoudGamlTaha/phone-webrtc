@@ -107,6 +107,17 @@ func getAgentByUsername(username string) (*Agent, error) {
 	return a, nil
 }
 
+func createAgent(username, passwordHash, displayName, extension string) (int64, error) {
+	result, err := db.Exec(
+		"INSERT INTO agents (username, password_hash, display_name, extension, sip_password, is_active) VALUES (?, ?, ?, ?, '', 1)",
+		username, passwordHash, displayName, extension,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
 func getAgentByID(id int64) (*Agent, error) {
 	a := &Agent{}
 	err := db.QueryRow(
