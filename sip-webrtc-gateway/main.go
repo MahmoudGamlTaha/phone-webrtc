@@ -410,6 +410,10 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 	req.AppendHeader(&toHdr)
 	req.AppendHeader(contactHdr)
 	req.AppendHeader(&contentTypeHeaderSDP)
+	// CSeq and Call-ID are required headers - TransactionRequest does not auto-generate them
+	req.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d INVITE", time.Now().UnixNano()%1e9)))
+	req.AppendHeader(sip.NewHeader("Call-ID", fmt.Sprintf("gw-%d@%s", time.Now().UnixNano(), *publicIP)))
+	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
 	req.SetBody(sdpBytes)
 
 	// Use Transaction-level approach to capture 180 Ringing provisional responses
