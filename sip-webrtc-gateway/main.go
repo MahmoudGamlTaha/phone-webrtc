@@ -421,6 +421,7 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 
 	// Read provisional and final responses
 	var res *sip.Response
+InviteLoop:
 	for {
 		select {
 		case <-ctx.Done():
@@ -432,6 +433,7 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 				return nil, fmt.Errorf("INVITE transaction closed without response")
 			}
 			res = txRes
+			log.Printf("INVITE response: status=%d", res.StatusCode)
 
 			// Handle 180 Ringing - notify frontend
 			if res.StatusCode == 180 {
@@ -440,28 +442,43 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 				continue
 			}
 
-			// Handle 401/407 digest auth
+			// Handle 183 Session Progress (may have early media)
+			if res.StatusCode == 183 {
+				log.Printf("SIP 183 Session Progress received for call to %s", targetExtension)
+				continue
+			}
+
+			// Handle 401/407 digest auth - must terminate old transaction and create new one
 			if res.StatusCode == 401 || res.StatusCode == 407 {
-				res, err = gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
+				log.Printf("INVITE auth challenge received, doing digest auth")
+				// Terminate the old transaction
+				tx.Terminate()
+
+				// Do digest auth - this creates a new INVITE with credentials
+				// and returns the final response directly (no provisional responses)
+				authRes, authErr := gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
 					Username: agentExt,
 					Password: agentSIPPass,
 				})
-				if err != nil {
+				if authErr != nil {
 					cancel()
-					return nil, fmt.Errorf("INVITE digest auth: %w", err)
+					return nil, fmt.Errorf("INVITE digest auth: %w", authErr)
 				}
+				res = authRes
+				log.Printf("Digest auth response: status=%d", res.StatusCode)
+				// DoDigestAuth returns the final response directly, fall through to check below
 			}
 
 			// Any final response (2xx, 3xx, 4xx, 5xx, 6xx) - stop reading
 			if res.StatusCode >= 200 {
-				break
+				if res.StatusCode != 200 {
+					cancel()
+					return nil, fmt.Errorf("INVITE failed with status %d", res.StatusCode)
+				}
+				// Got 200 OK - exit loop
+				break InviteLoop
 			}
 		}
-	}
-
-	if res.StatusCode != 200 {
-		cancel()
-		return nil, fmt.Errorf("INVITE failed with status %d", res.StatusCode)
 	}
 
 	// Send ACK for 2xx (must use res.To() with remote tag, route to Contact URI from 200 OK)
@@ -469,7 +486,7 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 	ackReqURI := reqURI // default
 	if contact := res.Contact(); contact != nil {
 		ackReqURI = contact.Address
-		log.Printf("ACK routing to Contact URI: %s", ackReqURI)
+		log.Printf("ACK routing to Contact URI: %v", ackReqURI)
 	}
 	ackReq := sip.NewRequest(sip.ACK, ackReqURI)
 	ackReq.AppendHeader(req.Via())
@@ -478,7 +495,7 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 	ackReq.AppendHeader(req.CallID())
 	ackReq.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d ACK", req.CSeq().SeqNo)))
 	ackReq.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
-	log.Printf("Sending ACK for INVITE to %s (To tag from response)", ackReqURI)
+	log.Printf("Sending ACK for INVITE to %v (To tag from response)", ackReqURI)
 	if err := gw.sipClient.WriteRequest(ackReq); err != nil {
 		log.Printf("Failed to send ACK: %v", err)
 	}

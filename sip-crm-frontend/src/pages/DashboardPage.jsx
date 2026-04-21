@@ -97,6 +97,7 @@ function TasksView({ taskList, onToggle, onRefresh }) {
 export default function DashboardPage({ agent, onLogout }) {
   const [callStatus, setCallStatus] = useState('idle')
   const [currentExt, setCurrentExt] = useState('')
+  const [dialError, setDialError] = useState('')
   const [customerList, setCustomerList] = useState([])
   const [callHistory, setCallHistory] = useState([])
   const [taskList, setTaskList] = useState([])
@@ -118,10 +119,11 @@ export default function DashboardPage({ agent, onLogout }) {
     sip.setEventHandler((event, data) => {
       if (event === 'ws-connected' || event === 'auth-ok') setWsConnected(true)
       if (event === 'ws-disconnected') setWsConnected(false)
-      if (event === 'dialing') { setCallStatus('dialing'); setCurrentExt(data) }
+      if (event === 'dialing') { setCallStatus('dialing'); setCurrentExt(data); setDialError('') }
       if (event === 'ringing') setCallStatus('ringing')
-      if (event === 'call-started') { setCallStatus('connected'); setCurrentExt(data); loadData() }
-      if (event === 'call-ended' || event === 'dial-error') { setCallStatus('idle'); setCurrentExt(''); loadData() }
+      if (event === 'call-started') { setCallStatus('connected'); setCurrentExt(data); setDialError(''); loadData() }
+      if (event === 'call-ended') { setCallStatus('idle'); setCurrentExt(''); setDialError(''); loadData() }
+      if (event === 'dial-error') { setCallStatus('idle'); setCurrentExt(''); setDialError(data || 'Call failed'); loadData() }
       if (event === 'mic-error') console.error('Mic access failed:', data, '- HTTPS may be required')
     })
     sip.connect()
@@ -129,10 +131,10 @@ export default function DashboardPage({ agent, onLogout }) {
 
   const handleCallCustomer = (customer) => {
     const ext = customer.phone || ''
-    if (ext) { sip.dial(ext, customer.id); setCallStatus('dialing'); setCurrentExt(ext) }
+    if (ext && callStatus === 'idle') { sip.dial(ext, customer.id); setCallStatus('dialing'); setCurrentExt(ext) }
   }
   const handleDial = () => {
-    if (dialNumber.trim()) { sip.dial(dialNumber.trim()); setCallStatus('dialing'); setCurrentExt(dialNumber.trim()) }
+    if (dialNumber.trim() && callStatus === 'idle') { sip.dial(dialNumber.trim()); setCallStatus('dialing'); setCurrentExt(dialNumber.trim()) }
   }
   const handleHangup = () => { sip.hangup(); setCallStatus('idle'); setCurrentExt('') }
   const handleToggleTask = async (task) => {
@@ -162,18 +164,19 @@ export default function DashboardPage({ agent, onLogout }) {
         <div className="p-4 border-b border-slate-800">
           <div className="flex gap-2">
             <input type="text" value={dialNumber} onChange={e => setDialNumber(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && handleDial()} placeholder="Dial extension..."
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); handleDial() } }} placeholder="Dial extension..."
               disabled={callStatus !== 'idle'}
               className="flex-1 px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:ring-2 focus:ring-blue-500 outline-none disabled:opacity-50" />
             {callStatus === 'idle' ? (
-              <button onClick={handleDial} disabled={!dialNumber.trim()} className="px-3 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 disabled:opacity-40"><Phone className="w-4 h-4" /></button>
+              <button type="button" onClick={handleDial} disabled={!dialNumber.trim()} className="px-3 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700 disabled:opacity-40"><Phone className="w-4 h-4" /></button>
             ) : (
-              <button onClick={handleHangup} className="px-3 py-2 bg-red-600 text-white rounded-lg text-sm hover:bg-red-700"><PhoneOff className="w-4 h-4" /></button>
+              <button type="button" onClick={handleHangup} className="px-3 py-2 bg-red-600 text-white rounded-lg text-sm hover:bg-red-700"><PhoneOff className="w-4 h-4" /></button>
             )}
           </div>
           {callStatus === 'dialing' && <div className="mt-2 flex items-center gap-2 text-amber-400 text-xs"><div className="w-2 h-2 bg-amber-500 rounded-full animate-pulse" /> Dialing {currentExt}...</div>}
           {callStatus === 'ringing' && <div className="mt-2 flex items-center gap-2 text-blue-400 text-xs"><Phone className="w-3 h-3 animate-pulse" /> Ringing {currentExt}...</div>}
           {callStatus === 'connected' && <div className="mt-2 flex items-center gap-2 text-green-400 text-xs"><CheckCircle className="w-3 h-3" /> Connected to {currentExt}</div>}
+          {dialError && <div className="mt-2 text-red-400 text-xs">{dialError}</div>}
           <div className="flex items-center gap-2 mt-2">
             <span className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-green-500' : 'bg-red-500'}`} />
             <span className="text-xs text-slate-500">{wsConnected ? 'Online' : 'Offline'}</span>
@@ -278,8 +281,8 @@ export default function DashboardPage({ agent, onLogout }) {
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <button onClick={() => handleCallCustomer(c)} className="p-2 text-green-400 hover:bg-green-500/10 rounded-lg" title="Call"><Phone className="w-4 h-4" /></button>
-                      <button onClick={() => setEditingCustomer(c)} className="p-2 text-blue-400 hover:bg-blue-500/10 rounded-lg" title="Edit"><User className="w-4 h-4" /></button>
+                      <button type="button" onClick={() => handleCallCustomer(c)} className="p-2 text-green-400 hover:bg-green-500/10 rounded-lg" title="Call"><Phone className="w-4 h-4" /></button>
+                      <button type="button" onClick={() => setEditingCustomer(c)} className="p-2 text-blue-400 hover:bg-blue-500/10 rounded-lg" title="Edit"><User className="w-4 h-4" /></button>
                     </div>
                   </div>
                 ))}

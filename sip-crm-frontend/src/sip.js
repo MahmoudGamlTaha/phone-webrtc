@@ -21,6 +21,11 @@ function emit(event, data) {
 export function connect() {
   // Idempotent: skip if already connected or connecting
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    // Already connected - just re-auth if needed
+    const token = getToken();
+    if (token && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ event: 'auth', data: token }));
+    }
     return;
   }
 
@@ -60,37 +65,39 @@ export function connect() {
   };
 
   // Create WebRTC PeerConnection - backend is the offerer, we are the answerer
-  pc = new RTCPeerConnection({
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-  });
+  // Only create if not already existing (prevents recreation on reconnect)
+  if (!pc) {
+    pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    });
 
-  // Do NOT addTransceiver here - ensureMicStream uses addTrack instead, which
-  // creates a transceiver with our mic track already attached. When the backend's
-  // offer arrives, setRemoteDescription matches this transceiver to the m-line,
-  // and createAnswer includes our mic SSRC. Pre-creating with addTransceiver
-  // (no track) caused m-line mismatch → one-way audio.
+    // Do NOT addTransceiver here - ensureMicStream uses addTrack instead, which
+    // creates a transceiver with our mic track already attached. When the backend's
+    // offer arrives, setRemoteDescription matches this transceiver to the m-line,
+    // and createAnswer includes our mic SSRC.
 
-  // Request mic early so it's ready when the offer arrives
-  ensureMicStream();
+    // Request mic early so it's ready when the offer arrives
+    ensureMicStream();
 
-  pc.onicecandidate = (e) => {
-    if (e.candidate) {
-      sendWS('candidate', JSON.stringify(e.candidate.toJSON()));
-    }
-  };
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        sendWS('candidate', JSON.stringify(e.candidate.toJSON()));
+      }
+    };
 
-  pc.ontrack = (e) => {
-    const remoteAudio = document.getElementById('remote-audio');
-    if (remoteAudio && e.streams[0]) {
-      remoteAudio.srcObject = e.streams[0];
-      remoteAudio.play().catch(() => {});
-    }
-    emit('remote-audio', '');
-  };
+    pc.ontrack = (e) => {
+      const remoteAudio = document.getElementById('remote-audio');
+      if (remoteAudio && e.streams[0]) {
+        remoteAudio.srcObject = e.streams[0];
+        remoteAudio.play().catch(() => {});
+      }
+      emit('remote-audio', '');
+    };
 
-  pc.onconnectionstatechange = () => {
-    emit('pc-state', pc.connectionState);
-  };
+    pc.onconnectionstatechange = () => {
+      emit('pc-state', pc.connectionState);
+    };
+  }
 }
 
 // ensureMicStream requests microphone and adds the track to the PeerConnection.
