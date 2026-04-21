@@ -410,7 +410,6 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 	req.AppendHeader(&toHdr)
 	req.AppendHeader(contactHdr)
 	req.AppendHeader(&contentTypeHeaderSDP)
-	// CSeq and Call-ID are required headers - TransactionRequest does not auto-generate them
 	req.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d INVITE", time.Now().UnixNano()%1e9)))
 	req.AppendHeader(sip.NewHeader("Call-ID", fmt.Sprintf("gw-%d@%s", time.Now().UnixNano(), *publicIP)))
 	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
@@ -425,6 +424,7 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 
 	// Read provisional and final responses
 	var res *sip.Response
+	var authDone bool
 InviteLoop:
 	for {
 		select {
@@ -452,14 +452,18 @@ InviteLoop:
 				continue
 			}
 
-			// Handle 401/407 digest auth - must terminate old transaction and create new one
-			if res.StatusCode == 401 || res.StatusCode == 407 {
+			// Handle 401/407 digest auth
+			if (res.StatusCode == 401 || res.StatusCode == 407) && !authDone {
 				log.Printf("INVITE auth challenge received, doing digest auth")
-				// Terminate the old transaction
 				tx.Terminate()
 
-				// Do digest auth - this creates a new INVITE with credentials
-				// and returns the final response directly (no provisional responses)
+				// Remove Via header added by previous TransactionRequest.
+				// DoDigestAuth internally calls Do() which adds its own Via,
+				// so keeping the old one causes duplicate Via → server rejects with 401.
+				req.RemoveHeader("Via")
+
+				// Do digest auth - this adds Authorization header and calls Do()
+				// which creates a new transaction with a fresh Via header
 				authRes, authErr := gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
 					Username: agentExt,
 					Password: agentSIPPass,
@@ -469,8 +473,18 @@ InviteLoop:
 					return nil, fmt.Errorf("INVITE digest auth: %w", authErr)
 				}
 				res = authRes
+				authDone = true
 				log.Printf("Digest auth response: status=%d", res.StatusCode)
-				// DoDigestAuth returns the final response directly, fall through to check below
+
+				// DoDigestAuth returns the final response directly
+				if res.StatusCode >= 200 {
+					if res.StatusCode != 200 {
+						cancel()
+						return nil, fmt.Errorf("INVITE failed with status %d", res.StatusCode)
+					}
+					break InviteLoop
+				}
+				continue
 			}
 
 			// Any final response (2xx, 3xx, 4xx, 5xx, 6xx) - stop reading
