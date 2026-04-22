@@ -452,10 +452,14 @@ InviteLoop:
 			}
 
 			// Handle 401/407 digest auth using TransactionDigestAuth
-			// This creates a new authenticated transaction (no duplicate Via issue)
 			if res.StatusCode == 401 || res.StatusCode == 407 {
 				log.Printf("INVITE auth challenge received, doing transaction digest auth")
 				tx.Terminate()
+
+				// Remove Via header from previous TransactionRequest call.
+				// TransactionDigestAuth will call TransactionRequest internally which adds a fresh Via.
+				// Keeping the old Via causes duplicate Via headers → 482 Loop Detected.
+				req.RemoveHeader("Via")
 
 				authTx, authErr := gw.sipClient.TransactionDigestAuth(ctx, req, res, sipgo.DigestAuth{
 					Username: agentExt,
