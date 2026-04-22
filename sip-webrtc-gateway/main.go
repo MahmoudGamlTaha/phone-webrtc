@@ -415,16 +415,15 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
 	req.SetBody(sdpBytes)
 
-	// Use Transaction-level approach to capture 180 Ringing provisional responses
+	// Use TransactionRequest to send INVITE and read all responses (including provisional)
 	tx, err := gw.sipClient.TransactionRequest(ctx, req, sipgo.ClientRequestAddVia)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("INVITE transaction request: %w", err)
 	}
 
-	// Read provisional and final responses
+	// Read responses from the transaction, including provisional (180 Ringing)
 	var res *sip.Response
-	var authDone bool
 InviteLoop:
 	for {
 		select {
@@ -452,19 +451,13 @@ InviteLoop:
 				continue
 			}
 
-			// Handle 401/407 digest auth
-			if (res.StatusCode == 401 || res.StatusCode == 407) && !authDone {
-				log.Printf("INVITE auth challenge received, doing digest auth")
+			// Handle 401/407 digest auth using TransactionDigestAuth
+			// This creates a new authenticated transaction (no duplicate Via issue)
+			if res.StatusCode == 401 || res.StatusCode == 407 {
+				log.Printf("INVITE auth challenge received, doing transaction digest auth")
 				tx.Terminate()
 
-				// Remove Via header added by previous TransactionRequest.
-				// DoDigestAuth internally calls Do() which adds its own Via,
-				// so keeping the old one causes duplicate Via → server rejects with 401.
-				req.RemoveHeader("Via")
-
-				// Do digest auth - this adds Authorization header and calls Do()
-				// which creates a new transaction with a fresh Via header
-				authRes, authErr := gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
+				authTx, authErr := gw.sipClient.TransactionDigestAuth(ctx, req, res, sipgo.DigestAuth{
 					Username: agentExt,
 					Password: agentSIPPass,
 				})
@@ -472,18 +465,8 @@ InviteLoop:
 					cancel()
 					return nil, fmt.Errorf("INVITE digest auth: %w", authErr)
 				}
-				res = authRes
-				authDone = true
-				log.Printf("Digest auth response: status=%d", res.StatusCode)
-
-				// DoDigestAuth returns the final response directly
-				if res.StatusCode >= 200 {
-					if res.StatusCode != 200 {
-						cancel()
-						return nil, fmt.Errorf("INVITE failed with status %d", res.StatusCode)
-					}
-					break InviteLoop
-				}
+				// Continue reading from the authenticated transaction
+				tx = authTx
 				continue
 			}
 
@@ -493,7 +476,6 @@ InviteLoop:
 					cancel()
 					return nil, fmt.Errorf("INVITE failed with status %d", res.StatusCode)
 				}
-				// Got 200 OK - exit loop
 				break InviteLoop
 			}
 		}
