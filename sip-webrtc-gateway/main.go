@@ -410,79 +410,37 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 	req.AppendHeader(&toHdr)
 	req.AppendHeader(contactHdr)
 	req.AppendHeader(&contentTypeHeaderSDP)
-	req.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d INVITE", time.Now().UnixNano()%1e9)))
-	req.AppendHeader(sip.NewHeader("Call-ID", fmt.Sprintf("gw-%d@%s", time.Now().UnixNano(), *publicIP)))
-	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
 	req.SetBody(sdpBytes)
 
-	// Use TransactionRequest to send INVITE and read all responses (including provisional)
-	tx, err := gw.sipClient.TransactionRequest(ctx, req, sipgo.ClientRequestAddVia)
+	// Notify frontend that the phone is ringing (play ringback tone immediately)
+	gw.notifyRinging(ws)
+
+	// Send INVITE using Do() which handles Via, CSeq, Call-ID, Max-Forwards automatically
+	log.Printf("Sending SIP INVITE to %s", targetExtension)
+	res, err := gw.sipClient.Do(ctx, req)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("INVITE transaction request: %w", err)
+		return nil, fmt.Errorf("SIP INVITE Do: %w", err)
+	}
+	log.Printf("INVITE initial response: status=%d", res.StatusCode)
+
+	// Handle 401/407 digest auth challenge
+	if res.StatusCode == 401 || res.StatusCode == 407 {
+		log.Printf("INVITE auth challenge received (%d), doing digest auth", res.StatusCode)
+		res, err = gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
+			Username: agentExt,
+			Password: agentSIPPass,
+		})
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("INVITE digest auth: %w", err)
+		}
+		log.Printf("INVITE digest auth response: status=%d", res.StatusCode)
 	}
 
-	// Read responses from the transaction, including provisional (180 Ringing)
-	var res *sip.Response
-InviteLoop:
-	for {
-		select {
-		case <-ctx.Done():
-			cancel()
-			return nil, fmt.Errorf("INVITE timeout")
-		case txRes, ok := <-tx.Responses():
-			if !ok {
-				cancel()
-				return nil, fmt.Errorf("INVITE transaction closed without response")
-			}
-			res = txRes
-			log.Printf("INVITE response: status=%d", res.StatusCode)
-
-			// Handle 180 Ringing - notify frontend
-			if res.StatusCode == 180 {
-				log.Printf("SIP 180 Ringing received for call to %s", targetExtension)
-				gw.notifyRinging(ws)
-				continue
-			}
-
-			// Handle 183 Session Progress (may have early media)
-			if res.StatusCode == 183 {
-				log.Printf("SIP 183 Session Progress received for call to %s", targetExtension)
-				continue
-			}
-
-			// Handle 401/407 digest auth using TransactionDigestAuth
-			if res.StatusCode == 401 || res.StatusCode == 407 {
-				log.Printf("INVITE auth challenge received, doing transaction digest auth")
-				tx.Terminate()
-
-				// Remove Via header from previous TransactionRequest call.
-				// TransactionDigestAuth will call TransactionRequest internally which adds a fresh Via.
-				// Keeping the old Via causes duplicate Via headers → 482 Loop Detected.
-				req.RemoveHeader("Via")
-
-				authTx, authErr := gw.sipClient.TransactionDigestAuth(ctx, req, res, sipgo.DigestAuth{
-					Username: agentExt,
-					Password: agentSIPPass,
-				})
-				if authErr != nil {
-					cancel()
-					return nil, fmt.Errorf("INVITE digest auth: %w", authErr)
-				}
-				// Continue reading from the authenticated transaction
-				tx = authTx
-				continue
-			}
-
-			// Any final response (2xx, 3xx, 4xx, 5xx, 6xx) - stop reading
-			if res.StatusCode >= 200 {
-				if res.StatusCode != 200 {
-					cancel()
-					return nil, fmt.Errorf("INVITE failed with status %d", res.StatusCode)
-				}
-				break InviteLoop
-			}
-		}
+	if res.StatusCode != 200 {
+		cancel()
+		return nil, fmt.Errorf("INVITE failed with status %d", res.StatusCode)
 	}
 
 	// Send ACK for 2xx (must use res.To() with remote tag, route to Contact URI from 200 OK)
