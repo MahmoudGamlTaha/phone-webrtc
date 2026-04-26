@@ -59,7 +59,8 @@ var (
 	//	dbPath   = flag.String("db", "root:@tcp(127.0.0.1:3306)/mini_call_crm?parseTime=true", "MySQL DSN (user:password@tcp(host:port)/dbname?parseTime=true)")
 	dbPath = flag.String("db", "mini-crm:ZtRlUn3@p7sbo!0l@tcp(62.171.174.59:3306)/mini_crm?parseTime=true", "MySQL DSN (user:password@tcp(host:port)/dbname?parseTime=true)")
 
-	// SIP client flags (for registering with PBX and making outbound calls)
+	// SIP client flags (for
+	// registering with PBX and making outbound calls)
 	sipServerAddr = flag.String("sip-server", "173.199.70.125:5666", "SIP server address (host:port), e.g. 173.199.70.125:5668")
 	sipUsername   = flag.String("sip-username", "5000", "SIP extension/username to register as")
 	sipPassword   = flag.String("sip-password", "881d93316235d6f7492aeb028ab7b588", "SIP password for digest auth")
@@ -121,10 +122,13 @@ type peerState struct {
 	ws                 *threadSafeWriter
 	pc                 *webrtc.PeerConnection
 	call               *sipCall
-	callReady          chan struct{} // Signaled when a SIP call is associated with this peer (replaces busy-wait)
-	negotiateMu        sync.Mutex    // Prevents concurrent renegotiation
-	negotiating        bool          // True when an offer/answer exchange is in progress
-	pendingRenegotiate bool          // True if renegotiation was requested while already negotiating
+	callReady          chan struct{}               // Signaled when a SIP call is associated with this peer (replaces busy-wait)
+	negotiateMu        sync.Mutex                  // Prevents concurrent renegotiation
+	negotiating        bool                        // True when an offer/answer exchange is in progress
+	pendingRenegotiate bool                        // True if renegotiation was requested while already negotiating
+	placeholderTrack   *webrtc.TrackLocalStaticRTP // Placeholder track to swap back on hangup (avoids renegotiation)
+	dialCancel         context.CancelFunc          // Cancel an in-progress dial (before call object exists)
+	dialing            bool                        // True when handleDial is running (INVITE in progress)
 
 	// CRM fields
 	agentID      int64  // Logged-in agent ID
@@ -376,8 +380,8 @@ func (gw *gateway) registerSIP() error {
 }
 
 // dialSIP sends an INVITE to the PBX for a target extension using the given agent credentials
-func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRTPPort int, agentExt, agentSIPPass string) (*sipCall, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRTPPort int, agentExt, agentSIPPass string, parentCtx context.Context) (*sipCall, error) {
+	ctx, cancel := context.WithTimeout(parentCtx, 60*time.Second)
 
 	// Build SDP offer for the INVITE
 	sdpOffer := buildSDPOffer(*publicIP, localRTPPort)
@@ -509,11 +513,6 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 		agentPass:  agentSIPPass,
 	}
 
-	// Store the call
-	gw.mu.Lock()
-	gw.calls[callID] = call
-	gw.mu.Unlock()
-
 	log.Printf("Outbound SIP call established to %s (Call-ID: %s)", targetExtension, callID)
 	return call, nil
 }
@@ -615,6 +614,34 @@ func (gw *gateway) onSIPInvite(req *sip.Request, tx sip.ServerTransaction) {
 		return
 	}
 
+	// Extract dialog fields from the inbound INVITE for BYE construction
+	inFromTag := ""
+	if ft, ok := req.From().Params.Get("tag"); ok {
+		inFromTag = ft
+	}
+	inToTag := ""
+	// We add our own To tag when sending 200 OK - generate one
+	inToTag = "gw-" + fmt.Sprintf("%d", time.Now().UnixNano())
+	inCseqNo := uint32(0)
+	if req.CSeq() != nil {
+		inCseqNo = req.CSeq().SeqNo
+	}
+	// Contact URI for BYE: use the Contact from the INVITE (where the caller wants to receive requests)
+	inContactURI := sip.Uri{Host: *sipDomain, Port: sipServerPort}
+	if contact := req.Contact(); contact != nil {
+		inContactURI = contact.Address
+	}
+	// For inbound BYE: we are the "To" party, caller is the "From" party
+	// Our From = the INVITE's To (our side), Our To = the INVITE's From (caller)
+	inFromUser := ""
+	if req.To() != nil {
+		inFromUser = req.To().Address.User
+	}
+	inToUser := ""
+	if req.From() != nil {
+		inToUser = req.From().Address.User
+	}
+
 	call := &sipCall{
 		rtpConn:    rtpConn,
 		sdpAddr:    remoteAddr,
@@ -622,6 +649,15 @@ func (gw *gateway) onSIPInvite(req *sip.Request, tx sip.ServerTransaction) {
 		from:       from,
 		callID:     callID,
 		audioTrack: audioTrack,
+
+		// Dialog fields for BYE (inbound: we are UAS, caller is UAC)
+		fromTag:    inToTag,   // Our tag (the To tag we assigned in 200 OK)
+		toTag:      inFromTag, // Caller's tag (the From tag from INVITE)
+		cseqNo:     inCseqNo,
+		contactURI: inContactURI,
+		agentExt:   inFromUser, // Our side (the To party of the INVITE)
+		agentPass:  *sipPassword,
+		to:         inToUser, // The caller (the From party of the INVITE)
 	}
 
 	// Store the call
@@ -646,6 +682,10 @@ func (gw *gateway) onSIPInvite(req *sip.Request, tx sip.ServerTransaction) {
 	res := sip.NewResponseFromRequest(req, 200, "OK", sdpAnswer)
 	res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{Host: *publicIP, Port: *sipListenPort}})
 	res.AppendHeader(&contentTypeHeaderSDP)
+	// Add our To tag to the 200 OK response (required for SIP dialog)
+	if res.To() != nil {
+		res.To().Params.Add("tag", inToTag)
+	}
 
 	if err := tx.Respond(res); err != nil {
 		log.Printf("Failed to respond to INVITE: %v", err)
@@ -753,6 +793,21 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 			if pt >= 200 {
 				continue // skip RTCP Sender Report, Receiver Report, etc.
 			}
+			// Filter comfort noise (PT=13) and telephone-event/DTMF (PT=101 or dynamic 96-127)
+			// These are NOT PCMU audio and cause "ssshhh" static when written to WebRTC track
+			if pt == 13 || pt == 101 || (pt >= 96 && pt != 0) {
+				continue
+			}
+		}
+
+		// Drop first 10 RTP packets - they often contain ringback tail/noise from PBX
+		// which causes the "ssshhh" static sound at call start
+		pktCount++
+		if pktCount <= 10 {
+			if pktCount == 1 {
+				log.Printf("Dropping first 10 RTP packets (noise filter)")
+			}
+			continue
 		}
 
 		// RTP latching: use actual source address as destination for outgoing RTP
@@ -775,8 +830,7 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 			seqInit = true
 		}
 
-		pktCount++
-		if pktCount <= 5 || pktCount%500 == 0 {
+		if pktCount <= 15 || pktCount%500 == 0 {
 			log.Printf("SIP→WebRTC: pkt #%d, %d bytes from %s", pktCount, n, addr)
 		}
 
@@ -835,10 +889,21 @@ func (gw *gateway) endCall(callID string) {
 	}
 	delete(gw.calls, callID)
 
-	// Remove call association from any peer that has it
+	// Remove call association from any peer that has it, and swap back to placeholder track
 	for _, peer := range gw.peers {
 		if peer.call != nil && peer.call.callID == callID {
 			peer.call = nil
+			// Replace SIP audio track back with placeholder (no renegotiation needed)
+			if call.audioTrack != nil && peer.placeholderTrack != nil {
+				senders := peer.pc.GetSenders()
+				if len(senders) > 0 {
+					if err := senders[0].ReplaceTrack(peer.placeholderTrack); err != nil {
+						log.Printf("Failed to replace track back to placeholder: %v", err)
+					} else {
+						log.Printf("Replaced SIP track back to placeholder (no renegotiation)")
+					}
+				}
+			}
 		}
 	}
 	gw.mu.Unlock()
@@ -846,11 +911,6 @@ func (gw *gateway) endCall(callID string) {
 	// Cancel the RTP forwarding context
 	if call.cancelFunc != nil {
 		call.cancelFunc()
-	}
-
-	// Remove the audio track from all WebRTC peers
-	if call.audioTrack != nil {
-		gw.removeTrackFromAllPeers(call.audioTrack)
 	}
 
 	// Close the RTP connection
@@ -1206,7 +1266,7 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Register the peer BEFORE setting OnTrack so the handler can reference it
-	peer := &peerState{ws: safeWS, pc: pc, callReady: make(chan struct{}, 1)}
+	peer := &peerState{ws: safeWS, pc: pc, callReady: make(chan struct{}, 1), placeholderTrack: placeholderTrack}
 	gw.mu.Lock()
 	gw.peers[safeWS] = peer
 
@@ -1343,7 +1403,7 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			log.Printf("Dial request for extension: %s (agentID=%d, customerID=%v)", extension, peer.agentID, customerID)
-			gw.handleDial(safeWS, peer, extension, customerID)
+			go gw.handleDial(safeWS, peer, extension, customerID)
 
 		case "hangup":
 			log.Printf("Hangup request from browser")
@@ -1358,12 +1418,23 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 // handleDial processes a dial request from the browser
 func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension string, customerID *int64) {
 	gw.mu.Lock()
-	if peer.call != nil {
+	if peer.call != nil || peer.dialing {
 		gw.mu.Unlock()
 		ws.WriteJSON(wsMessage{Event: "dial-error", Data: "Already in a call"})
 		return
 	}
+	peer.dialing = true
+	dialCtx, dialCancel := context.WithCancel(context.Background())
+	peer.dialCancel = dialCancel
 	gw.mu.Unlock()
+
+	// Ensure cleanup on any exit path
+	defer func() {
+		gw.mu.Lock()
+		peer.dialing = false
+		peer.dialCancel = nil
+		gw.mu.Unlock()
+	}()
 
 	if gw.sipClient == nil {
 		ws.WriteJSON(wsMessage{Event: "dial-error", Data: "SIP client not configured"})
@@ -1390,19 +1461,80 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 		return
 	}
 
-	// Send INVITE to PBX using agent's SIP credentials
-	call, err := gw.dialSIP(ws, extension, rtpPort, peer.agentExt, peer.agentSIPPass)
+	// Create audio track BEFORE sending INVITE so the WebRTC audio path is ready
+	// immediately when the 200 OK arrives (eliminates connection delay).
+	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU},
+		fmt.Sprintf("sip-out-%d", time.Now().UnixNano()),
+		"pion-sip-out",
+	)
 	if err != nil {
+		log.Printf("Failed to create outbound audio track: %v", err)
+		rtpConn.Close()
+		ws.WriteJSON(wsMessage{Event: "dial-error", Data: "Failed to create audio track"})
+		return
+	}
+
+	// Replace the placeholder track on the existing sendrecv transceiver's sender.
+	// Since the sender already has a track (placeholder), ReplaceTrack is a simple swap
+	// that does NOT require renegotiation — audio path stays intact.
+	senders := peer.pc.GetSenders()
+	if len(senders) > 0 {
+		if err := senders[0].ReplaceTrack(audioTrack); err != nil {
+			log.Printf("Failed to replace track on sender: %v", err)
+		} else {
+			log.Printf("Replaced placeholder track with SIP audio track (before INVITE)")
+		}
+	} else {
+		log.Printf("WARNING: no sender found, falling back to AddTrack")
+		if _, err := peer.pc.AddTrack(audioTrack); err != nil {
+			log.Printf("Failed to add outbound audio track: %v", err)
+		}
+		gw.renegotiatePeer(peer)
+	}
+
+	// Create partial call object for forwardRTPToTrack (fills in after dialSIP returns)
+	call := &sipCall{
+		rtpConn:    rtpConn,
+		audioTrack: audioTrack,
+		isOutbound: true,
+		agentExt:   peer.agentExt,
+		agentPass:  peer.agentSIPPass,
+	}
+
+	// Start forwarding RTP from SIP to WebRTC track BEFORE INVITE
+	// so packets flow immediately when the PBX starts sending after 200 OK
+	ctx, cancel := context.WithCancel(context.Background())
+	call.cancelFunc = cancel
+	go gw.forwardRTPToTrack(ctx, call)
+
+	// Send INVITE to PBX using agent's SIP credentials (blocks until 200 OK or error)
+	// Uses dialCtx so hangup during dial cancels the INVITE
+	sipCall, err := gw.dialSIP(ws, extension, rtpPort, peer.agentExt, peer.agentSIPPass, dialCtx)
+	if err != nil {
+		cancel()
+		// Swap back to placeholder track since dial failed
+		if peer.placeholderTrack != nil {
+			senders := peer.pc.GetSenders()
+			if len(senders) > 0 {
+				senders[0].ReplaceTrack(peer.placeholderTrack)
+			}
+		}
 		rtpConn.Close()
 		ws.WriteJSON(wsMessage{Event: "dial-error", Data: fmt.Sprintf("SIP INVITE failed: %v", err)})
 		return
 	}
 
-	call.rtpConn = rtpConn
-
-	// Create context for RTP forwarding and keepalive
-	ctx, cancel := context.WithCancel(context.Background())
-	call.cancelFunc = cancel
+	// Fill in SIP dialog fields from the successful INVITE
+	call.callID = sipCall.callID
+	call.from = sipCall.from
+	call.to = sipCall.to
+	call.sdpAddr = sipCall.sdpAddr
+	call.remoteAddr = sipCall.remoteAddr
+	call.fromTag = sipCall.fromTag
+	call.toTag = sipCall.toTag
+	call.cseqNo = sipCall.cseqNo
+	call.contactURI = sipCall.contactURI
 
 	// Send NAT keepalive packets to open the RTP pinhole
 	// The PBX needs to receive a packet from us first so its NAT/firewall allows return traffic
@@ -1421,55 +1553,11 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 					if _, err := rtpConn.WriteToUDP(keepalive, call.sdpAddr); err != nil {
 						return
 					}
-					log.Printf("NAT keepalive sent to %s", call.sdpAddr)
 				case <-ctx.Done():
 					return
 				}
 			}
 		}()
-	}
-
-	// Sanitize callID for use in SDP (remove spaces, colons, etc.)
-	safeCallID := strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
-			return r
-		}
-		return '-'
-	}, strings.TrimPrefix(call.callID, "Call-ID: "))
-
-	// Create audio track for SIP→WebRTC direction
-	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU},
-		fmt.Sprintf("sip-out-%s", safeCallID),
-		"pion-sip-out",
-	)
-	if err != nil {
-		log.Printf("Failed to create outbound audio track: %v", err)
-		rtpConn.Close()
-		ws.WriteJSON(wsMessage{Event: "dial-error", Data: "Failed to create audio track"})
-		return
-	}
-	call.audioTrack = audioTrack
-
-	// Start forwarding RTP from SIP to WebRTC track
-	go gw.forwardRTPToTrack(ctx, call)
-
-	// Replace the placeholder track on the existing sendrecv transceiver's sender.
-	// Since the sender already has a track (placeholder), ReplaceTrack is a simple swap
-	// that does NOT require renegotiation — audio path stays intact.
-	senders := peer.pc.GetSenders()
-	if len(senders) > 0 {
-		if err := senders[0].ReplaceTrack(audioTrack); err != nil {
-			log.Printf("Failed to replace track on sender: %v", err)
-		} else {
-			log.Printf("Replaced sender track with SIP audio track (no renegotiation needed)")
-		}
-	} else {
-		log.Printf("WARNING: no sender found, falling back to AddTrack")
-		if _, err := peer.pc.AddTrack(audioTrack); err != nil {
-			log.Printf("Failed to add outbound audio track: %v", err)
-		}
-		gw.renegotiatePeer(peer)
 	}
 
 	// Set CRM fields on call
@@ -1486,8 +1574,10 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 	}
 
 	// Associate call with peer and signal the OnTrack handler
+	// Also store in global calls map (was previously done in dialSIP)
 	gw.mu.Lock()
 	peer.call = call
+	gw.calls[call.callID] = call
 	gw.mu.Unlock()
 	select {
 	case peer.callReady <- struct{}{}:
@@ -1504,9 +1594,20 @@ func (gw *gateway) handleHangup(peer *peerState) {
 	gw.mu.Lock()
 	call := peer.call
 	peer.call = nil
+
+	// If a dial is in progress (INVITE not yet completed), cancel it
+	if peer.dialing && peer.dialCancel != nil {
+		log.Printf("Cancelling in-progress dial")
+		peer.dialCancel()
+		peer.dialing = false
+		peer.dialCancel = nil
+	}
 	gw.mu.Unlock()
 
 	if call == nil {
+		// No active call, but we already cancelled any in-progress dial above
+		// Notify browser that call ended
+		peer.ws.WriteJSON(wsMessage{Event: "call-ended", Data: "cancelled"})
 		return
 	}
 
@@ -1523,8 +1624,8 @@ func (gw *gateway) handleHangup(peer *peerState) {
 		log.Printf("Call log updated: id=%d status=%s duration=%ds", call.callLogID, status, duration)
 	}
 
-	// Send BYE for outbound calls
-	if call.isOutbound && gw.sipClient != nil {
+	// Send BYE to PBX for both outbound and inbound calls
+	if gw.sipClient != nil {
 		if err := gw.sendSIPBye(call); err != nil {
 			log.Printf("Failed to send BYE: %v", err)
 		}
