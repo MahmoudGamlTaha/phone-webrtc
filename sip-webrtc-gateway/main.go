@@ -69,8 +69,8 @@ var (
 	sipListenPort = flag.Int("sip-listen-port", 5666, "Port to listen for inbound SIP traffic")
 
 	// RTP port range (open these UDP ports on your server firewall)
-	rtpPortMin = flag.Int("rtp-port-min", 10000, "Minimum RTP port (inclusive)")
-	rtpPortMax = flag.Int("rtp-port-max", 10020, "Maximum RTP port (inclusive)")
+	rtpPortMin = flag.Int("rtp-port-min", 1000, "Minimum RTP port (inclusive)")
+	rtpPortMax = flag.Int("rtp-port-max", 20020, "Maximum RTP port (inclusive)")
 
 	// TLS flags for HTTPS (required for browser mic access)
 	enableTLS = flag.Bool("tls", false, "Enable HTTPS with auto-generated self-signed cert (required for browser mic access)")
@@ -1121,12 +1121,24 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer pc.Close()
 
-	// Add sendrecv audio transceiver - sender has nil track initially.
-	// handleDial will use ReplaceTrack to put the real SIP audio track on this sender.
+	// Create a placeholder audio track so the sender always has a track.
+	// This allows handleDial to use ReplaceTrack (track→track swap) without renegotiation.
+	// Without a placeholder, ReplaceTrack from nil→track requires renegotiation which breaks audio.
+	placeholderTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU},
+		"placeholder", "pion-placeholder",
+	)
+	if err != nil {
+		log.Printf("Failed to create placeholder track: %v", err)
+		return
+	}
+
+	// Add sendrecv audio transceiver with the placeholder track.
+	// handleDial will use ReplaceTrack to swap it with the real SIP audio track.
 	// This ensures ONE audio m-line with a=sendrecv in the offer.
-	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionSendrecv,
-	}); err != nil {
+	if _, err := pc.AddTransceiverFromTrack(placeholderTrack,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendrecv},
+	); err != nil {
 		log.Printf("Failed to add audio transceiver: %v", err)
 		return
 	}
@@ -1410,24 +1422,23 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 	// Start forwarding RTP from SIP to WebRTC track
 	go gw.forwardRTPToTrack(ctx, call)
 
-	// Replace the track on the existing sendrecv transceiver's sender.
-	// First call: sender has nil track (from AddTransceiverFromKind on connect).
-	// Subsequent calls: sender has track from previous call.
-	// Using AddTrack would create a SECOND transceiver → two m-lines → broken audio.
+	// Replace the placeholder track on the existing sendrecv transceiver's sender.
+	// Since the sender already has a track (placeholder), ReplaceTrack is a simple swap
+	// that does NOT require renegotiation — audio path stays intact.
 	senders := peer.pc.GetSenders()
 	if len(senders) > 0 {
 		if err := senders[0].ReplaceTrack(audioTrack); err != nil {
 			log.Printf("Failed to replace track on sender: %v", err)
 		} else {
-			log.Printf("Replaced sender track with SIP audio track (sendrecv)")
+			log.Printf("Replaced sender track with SIP audio track (no renegotiation needed)")
 		}
 	} else {
 		log.Printf("WARNING: no sender found, falling back to AddTrack")
 		if _, err := peer.pc.AddTrack(audioTrack); err != nil {
 			log.Printf("Failed to add outbound audio track: %v", err)
 		}
+		gw.renegotiatePeer(peer)
 	}
-	gw.renegotiatePeer(peer)
 
 	// Set CRM fields on call
 	call.callLogID = callLogID
