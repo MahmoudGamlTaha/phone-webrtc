@@ -69,8 +69,8 @@ var (
 	sipListenPort = flag.Int("sip-listen-port", 5666, "Port to listen for inbound SIP traffic")
 
 	// RTP port range (open these UDP ports on your server firewall)
-	rtpPortMin = flag.Int("rtp-port-min", 1000, "Minimum RTP port (inclusive)")
-	rtpPortMax = flag.Int("rtp-port-max", 20020, "Maximum RTP port (inclusive)")
+	rtpPortMin = flag.Int("rtp-port-min", 10000, "Minimum RTP port (inclusive)")
+	rtpPortMax = flag.Int("rtp-port-max", 20000, "Maximum RTP port (inclusive)")
 
 	// TLS flags for HTTPS (required for browser mic access)
 	enableTLS = flag.Bool("tls", false, "Enable HTTPS with auto-generated self-signed cert (required for browser mic access)")
@@ -698,6 +698,14 @@ func startRTPListener() (*net.UDPConn, int, error) {
 			IP:   net.ParseIP("0.0.0.0"),
 		})
 		if err == nil {
+			// Increase UDP receive buffer to prevent OS-level packet drops (choppy audio)
+			// Default is ~8KB which overflows quickly; 4MB holds ~2 seconds of PCMU audio
+			if err := conn.SetReadBuffer(4 * 1024 * 1024); err != nil {
+				log.Printf("Warning: failed to increase UDP read buffer: %v", err)
+			}
+			if err := conn.SetWriteBuffer(4 * 1024 * 1024); err != nil {
+				log.Printf("Warning: failed to increase UDP write buffer: %v", err)
+			}
 			rtpPortCounter = (port - min + 1) % (max - min + 1)
 			log.Printf("RTP listener started on UDP port %d", port)
 			return conn, port, nil
@@ -713,6 +721,8 @@ func startRTPListener() (*net.UDPConn, int, error) {
 func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 	buff := make([]byte, 1500)
 	pktCount := 0
+	var lastSeq uint16
+	seqInit := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -736,11 +746,33 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 			return
 		}
 
+		// Filter out RTCP packets (payload type >= 200 in byte 1 low 7 bits)
+		// RTCP mixed with RTP on the same port causes choppy/corrupted audio
+		if n >= 2 {
+			pt := buff[1] & 0x7F
+			if pt >= 200 {
+				continue // skip RTCP Sender Report, Receiver Report, etc.
+			}
+		}
+
 		// RTP latching: use actual source address as destination for outgoing RTP
 		if !call.latched {
 			call.latched = true
 			call.remoteAddr = addr
 			log.Printf("RTP latched: remoteAddr updated to %s (was SDP addr %s)", addr, call.sdpAddr)
+		}
+
+		// Track sequence numbers to detect gaps (packet loss causes choppy audio)
+		if n >= 4 {
+			seq := uint16(buff[2])<<8 | uint16(buff[3])
+			if seqInit {
+				gap := seq - lastSeq
+				if gap > 1 && gap < 30000 {
+					log.Printf("RTP seq gap: expected %d got %d (gap=%d) - packet loss detected", lastSeq+1, seq, gap-1)
+				}
+			}
+			lastSeq = seq
+			seqInit = true
 		}
 
 		pktCount++
