@@ -9,6 +9,7 @@ let iceCandidateQueue = [];
 let micPromise = null; // Deduplicates getUserMedia calls
 let ringbackCtx = null; // Web Audio API context for ringback tone
 let ringbackOsc = null; // Oscillator node for ringback tone
+let intentionalClose = false; // Set to true during disconnect() to prevent auto-reconnect
 
 export function setEventHandler(handler) {
   onEvent = handler;
@@ -19,6 +20,7 @@ function emit(event, data) {
 }
 
 export function connect() {
+  intentionalClose = false;
   // Idempotent: skip if already connected or connecting
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     // Already connected - just re-auth if needed
@@ -49,6 +51,13 @@ export function connect() {
   ws.onclose = () => {
     emit('ws-disconnected', '');
     ws = null;
+    // Auto-reconnect unless disconnect() was called intentionally
+    if (!intentionalClose) {
+      setTimeout(() => {
+        console.log('WebSocket closed unexpectedly, auto-reconnecting...');
+        connect();
+      }, 2000);
+    }
   };
 
   ws.onerror = (err) => {
@@ -316,9 +325,10 @@ export async function dial(extension, customerID) {
 }
 
 export function hangup() {
-  sendWS('hangup', '');
+  console.log('hangup() called, ws state:', ws ? ws.readyState : 'null');
   callActive = false;
   stopRingback();
+  sendWS('hangup', '');
   // Don't stop localStream on hangup - keep mic for next call
   // Stream will be stopped on disconnect()
 }
@@ -328,6 +338,7 @@ export function isCallActive() {
 }
 
 export function disconnect() {
+  intentionalClose = true;
   hangup();
   stopRingback();
   if (localStream) {

@@ -1770,17 +1770,26 @@ func (gw *gateway) removePeer(ws *threadSafeWriter) {
 		return
 	}
 
-	// Clean up any active call
+	// Cancel any in-progress dial
+	if peer.dialing && peer.dialCancel != nil {
+		peer.dialCancel()
+		peer.dialing = false
+		peer.dialCancel = nil
+	}
+
+	// Clean up any active call — send BYE to PBX for both inbound and outbound
 	if peer.call != nil {
-		if peer.call.isOutbound && gw.sipClient != nil {
+		callID := peer.call.callID
+		if gw.sipClient != nil {
 			go gw.sendSIPBye(peer.call)
 		}
-		go gw.endCall(peer.call.callID)
+		peer.call = nil
+		go gw.endCall(callID)
 	}
 
 	peer.pc.Close()
 	delete(gw.peers, ws)
-	log.Printf("Peer removed: %s", ws.RemoteAddr())
+	log.Printf("Peer removed: %s (active call cleaned up)", ws.RemoteAddr())
 }
 
 // buildSDPOffer creates a SIP SDP offer for an outbound INVITE
