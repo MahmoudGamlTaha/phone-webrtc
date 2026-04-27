@@ -1251,8 +1251,8 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("New WebSocket connection from %s", ws.RemoteAddr())
 
-	// Create a MediaEngine that ONLY supports PCMU (G.711u) to match PBX codec
-	// Without this, browser negotiates Opus which PBX can't decode
+	// Create a MediaEngine with PCMU only - this forces the browser to use PCMU for both
+	// send and receive, matching the PBX codec. Browsers support G.711 PCMU encoding natively.
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU, ClockRate: 8000, Channels: 1},
@@ -1262,10 +1262,18 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create API with custom MediaEngine
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+	// Create SettingEngine with NAT 1:1 IP mapping so ICE candidates use the server's public IP.
+	// Without this, the server behind NAT advertises its private IP and the browser can't send RTP back.
+	se := webrtc.SettingEngine{}
+	if *publicIP != "" {
+		se.SetNAT1To1IPs([]string{*publicIP}, webrtc.ICECandidateTypeHost)
+		log.Printf("WebRTC NAT1To1 set to: %s", *publicIP)
+	}
 
-	// Create PCMU-only PeerConnection
+	// Create API with custom MediaEngine and SettingEngine
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithSettingEngine(se))
+
+	// Create PeerConnection with STUN for ICE gathering
 	pc, err := api.NewPeerConnection(webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -1629,7 +1637,7 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 		}
 	}
 
-	// Associate call with peer and signal the OnTrack handler
+	// Associate call with peer
 	// Also store in global calls map (was previously done in dialSIP)
 	gw.mu.Lock()
 	peer.call = call
@@ -1637,26 +1645,33 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 	remoteTrack := peer.remoteTrack
 	gw.mu.Unlock()
 
+	// Notify frontend immediately (stops ringback tone)
+	ws.WriteJSON(wsMessage{Event: "call-started", Data: extension})
+	log.Printf("Outbound call to %s established for agent %d", extension, peer.agentID)
+
 	// Start WebRTC→SIP forwarding using the browser's mic track
-	// If OnTrack hasn't fired yet, wait briefly for it
-	if remoteTrack == nil {
-		log.Printf("Waiting for browser mic track (OnTrack not yet fired)...")
-		select {
-		case <-peer.callReady:
-			gw.mu.RLock()
-			remoteTrack = peer.remoteTrack
-			gw.mu.RUnlock()
-		case <-time.After(10 * time.Second):
-			log.Printf("Warning: browser mic track not available after 10s — WebRTC→SIP audio may not work")
-		}
-	}
+	// If OnTrack hasn't fired yet, wait in a goroutine so we don't block
 	if remoteTrack != nil {
 		go forwardTrackToRTP(ctx, remoteTrack, call)
 		log.Printf("WebRTC→SIP forwarding started for call %s", call.callID)
+	} else {
+		go func() {
+			log.Printf("Waiting for browser mic track (OnTrack not yet fired)...")
+			select {
+			case <-peer.callReady:
+				gw.mu.RLock()
+				rt := peer.remoteTrack
+				gw.mu.RUnlock()
+				if rt != nil {
+					forwardTrackToRTP(ctx, rt, call)
+				}
+			case <-ctx.Done():
+				// Call ended before mic track arrived
+			case <-time.After(30 * time.Second):
+				log.Printf("Warning: browser mic track not available after 30s — WebRTC→SIP audio will not work")
+			}
+		}()
 	}
-
-	ws.WriteJSON(wsMessage{Event: "call-started", Data: extension})
-	log.Printf("Outbound call to %s established for agent %d", extension, peer.agentID)
 }
 
 // handleHangup terminates the SIP call for a browser peer

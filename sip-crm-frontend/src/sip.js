@@ -104,7 +104,20 @@ export function connect() {
 // Must be called BEFORE setRemoteDescription so the track is on the transceiver
 // when createAnswer runs. This is the standard WebRTC answerer pattern.
 async function ensureMicStream() {
-  if (localStream) return true;
+  // If we already have a stream, ensure the track is on the current PC
+  if (localStream) {
+    const track = localStream.getAudioTracks()[0];
+    if (track && pc) {
+      // Check if track is already on a sender
+      const senders = pc.getSenders();
+      const alreadyAdded = senders.some(s => s.track && s.track.id === track.id);
+      if (!alreadyAdded) {
+        pc.addTrack(track, localStream);
+        console.log('ensureMicStream: re-added existing mic track to PC, track id=', track.id);
+      }
+    }
+    return true;
+  }
   if (micPromise) return micPromise;
   micPromise = (async () => {
     try {
@@ -115,7 +128,7 @@ async function ensureMicStream() {
         // addTrack creates an audio transceiver with our mic track.
         // When setRemoteDescription processes the offer, it will match this
         // transceiver to the offer's audio m-line by kind.
-        pc.addTrack(track, stream);
+        pc.addTrack(track, localStream);
         console.log('ensureMicStream: mic track added via addTrack, track id=', track.id);
       }
       emit('mic-ready', '');
