@@ -538,6 +538,13 @@ InviteLoop:
 		contactURI = contact.Address
 	}
 
+	// Use the response CSeq (not the original request CSeq) because DoDigestAuth
+	// may have incremented it internally. BYE needs CSeq > last used in dialog.
+	finalCSeq := req.CSeq().SeqNo
+	if res.CSeq() != nil {
+		finalCSeq = res.CSeq().SeqNo
+	}
+
 	call := &sipCall{
 		callID:     callID,
 		from:       agentExt,
@@ -548,7 +555,7 @@ InviteLoop:
 
 		fromTag:    fromTagVal,
 		toTag:      toTagVal,
-		cseqNo:     req.CSeq().SeqNo,
+		cseqNo:     finalCSeq,
 		contactURI: contactURI,
 		agentExt:   agentExt,
 		agentPass:  agentSIPPass,
@@ -588,9 +595,12 @@ func (gw *gateway) sendSIPBye(call *sipCall) error {
 	req.AppendHeader(sip.NewHeader("Call-ID", call.callID))
 	req.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d BYE", call.cseqNo+1)))
 	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
+	req.AppendHeader(&sip.ContactHeader{
+		Address: sip.Uri{User: call.agentExt, Host: *publicIP, Port: *sipListenPort},
+	})
 
-	log.Printf("Sending BYE: Call-ID=%s From=%s;tag=%s To=%s;tag=%s CSeq=%d",
-		call.callID, call.agentExt, call.fromTag, call.to, call.toTag, call.cseqNo+1)
+	log.Printf("Sending BYE: ReqURI=%v Call-ID=%s From=%s;tag=%s To=%s;tag=%s CSeq=%d",
+		reqURI, call.callID, call.agentExt, call.fromTag, call.to, call.toTag, call.cseqNo+1)
 
 	res, err := gw.sipClient.Do(ctx, req)
 	if err != nil {
@@ -1606,6 +1616,27 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 	call.toTag = sipCall.toTag
 	call.cseqNo = sipCall.cseqNo
 	call.contactURI = sipCall.contactURI
+	call.agentExt = peer.agentExt
+	call.agentPass = peer.agentSIPPass
+
+	// Check if user hung up while dialSIP was completing (race between 200 OK and hangup)
+	if dialCtx.Err() != nil {
+		log.Printf("Dial completed but user already hung up — sending BYE immediately")
+		cancel() // Stop RTP forwarding
+		if gw.sipClient != nil {
+			if err := gw.sendSIPBye(call); err != nil {
+				log.Printf("Failed to send BYE after late hangup: %v", err)
+			}
+		}
+		rtpConn.Close()
+		if peer.placeholderTrack != nil {
+			senders := peer.pc.GetSenders()
+			if len(senders) > 0 {
+				senders[0].ReplaceTrack(peer.placeholderTrack)
+			}
+		}
+		return
+	}
 
 	// Send NAT keepalive packets to open the RTP pinhole
 	// The PBX needs to receive a packet from us first so its NAT/firewall allows return traffic
