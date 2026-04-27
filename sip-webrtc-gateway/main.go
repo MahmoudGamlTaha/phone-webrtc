@@ -419,37 +419,80 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 	// Notify frontend that the phone is ringing (play ringback tone immediately)
 	gw.notifyRinging(ws)
 
-	// Send INVITE using Do() which handles Via, CSeq, Call-ID, Max-Forwards automatically
+	// Use TransactionRequest so we can Cancel() the INVITE if user hangs up during ringing
 	log.Printf("Sending SIP INVITE to %s", targetExtension)
-	res, err := gw.sipClient.Do(ctx, req)
+	tx, err := gw.sipClient.TransactionRequest(ctx, req)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("SIP INVITE Do: %w", err)
+		return nil, fmt.Errorf("SIP INVITE transaction: %w", err)
 	}
-	log.Printf("INVITE initial response: status=%d", res.StatusCode)
 
-	// Handle 401/407 digest auth challenge
-	if res.StatusCode == 401 || res.StatusCode == 407 {
-		log.Printf("INVITE auth challenge received (%d), doing digest auth", res.StatusCode)
-		res, err = gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
-			Username: agentExt,
-			Password: agentSIPPass,
-		})
-		if err != nil {
-			cancel()
-			return nil, fmt.Errorf("INVITE digest auth: %w", err)
+	// Wait for responses, handling provisional (180 Ringing) and auth challenges
+	var res *sip.Response
+	var authTx sip.ClientTransaction // track auth transaction separately
+InviteLoop:
+	for {
+		// Read from the appropriate transaction's response channel
+		respCh := tx.Responses()
+		if authTx != nil {
+			respCh = authTx.Responses()
 		}
-		log.Printf("INVITE digest auth response: status=%d", res.StatusCode)
-	}
+		select {
+		case <-ctx.Done():
+			// Context cancelled (user pressed cancel) — send SIP CANCEL to stop the phone ringing
+			log.Printf("INVITE context cancelled, sending CANCEL for Call-ID %s", req.CallID().String())
+			cancelReq := sip.NewRequest(sip.CANCEL, reqURI)
+			cancelReq.AppendHeader(req.Via())
+			cancelReq.AppendHeader(req.From())
+			cancelReq.AppendHeader(req.To())
+			cancelReq.AppendHeader(req.CallID())
+			cancelReq.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d CANCEL", req.CSeq().SeqNo)))
+			cancelReq.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
+			if _, err := gw.sipClient.TransactionRequest(context.Background(), cancelReq); err != nil {
+				log.Printf("Failed to send CANCEL: %v", err)
+			}
+			cancel()
+			return nil, ctx.Err()
+		case txRes, ok := <-respCh:
+			if !ok {
+				cancel()
+				return nil, fmt.Errorf("INVITE transaction closed without response")
+			}
+			res = txRes
+			log.Printf("INVITE response: status=%d", res.StatusCode)
 
-	if res.StatusCode != 200 {
-		cancel()
-		return nil, fmt.Errorf("INVITE failed with status %d", res.StatusCode)
+			switch {
+			case res.StatusCode == 100:
+				continue // Trying, wait for more
+			case res.StatusCode == 180 || res.StatusCode == 183:
+				// Ringing / Session Progress — keep waiting
+				log.Printf("Remote is ringing (status %d)", res.StatusCode)
+				continue
+			case res.StatusCode == 401 || res.StatusCode == 407:
+				// Auth challenge — do digest auth with a new transaction
+				log.Printf("INVITE auth challenge (%d), doing digest auth", res.StatusCode)
+				authTx, err = gw.sipClient.TransactionDigestAuth(ctx, req, res, sipgo.DigestAuth{
+					Username: agentExt,
+					Password: agentSIPPass,
+				})
+				if err != nil {
+					cancel()
+					return nil, fmt.Errorf("INVITE digest auth: %w", err)
+				}
+				continue // read responses from the auth transaction
+			case res.StatusCode >= 200 && res.StatusCode < 300:
+				// 200 OK — call established!
+				break InviteLoop
+			default:
+				// Error response (4xx, 5xx, 6xx)
+				cancel()
+				return nil, fmt.Errorf("INVITE failed with status %d", res.StatusCode)
+			}
+		}
 	}
 
 	// Send ACK for 2xx (must use res.To() with remote tag, route to Contact URI from 200 OK)
-	// For 2xx ACK, the Request-URI should be the Contact URI from the 200 OK response
-	ackReqURI := reqURI // default
+	ackReqURI := reqURI
 	if contact := res.Contact(); contact != nil {
 		ackReqURI = contact.Address
 		log.Printf("ACK routing to Contact URI: %v", ackReqURI)
@@ -457,11 +500,11 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 	ackReq := sip.NewRequest(sip.ACK, ackReqURI)
 	ackReq.AppendHeader(req.Via())
 	ackReq.AppendHeader(req.From())
-	ackReq.AppendHeader(res.To()) // Must use res.To() which has the remote tag
+	ackReq.AppendHeader(res.To())
 	ackReq.AppendHeader(req.CallID())
 	ackReq.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d ACK", req.CSeq().SeqNo)))
 	ackReq.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
-	log.Printf("Sending ACK for INVITE to %v (To tag from response)", ackReqURI)
+	log.Printf("Sending ACK for INVITE to %v", ackReqURI)
 	if err := gw.sipClient.WriteRequest(ackReq); err != nil {
 		log.Printf("Failed to send ACK: %v", err)
 	}
@@ -475,7 +518,6 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 		log.Printf("Remote RTP address from SDP: %s", remoteAddr)
 	}
 
-	// Cancel the INVITE timeout context (no longer needed after 200 OK)
 	cancel()
 
 	callID := req.CallID().String()
@@ -502,9 +544,8 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 		to:         targetExtension,
 		isOutbound: true,
 		sdpAddr:    remoteAddr,
-		remoteAddr: remoteAddr, // initial target, will be updated by RTP latching
+		remoteAddr: remoteAddr,
 
-		// Dialog fields for BYE
 		fromTag:    fromTagVal,
 		toTag:      toTagVal,
 		cseqNo:     req.CSeq().SeqNo,
@@ -1521,6 +1562,11 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 			}
 		}
 		rtpConn.Close()
+		// If the dial was cancelled by user (hangup), don't show as error - it's intentional
+		if dialCtx.Err() == context.Canceled {
+			log.Printf("Dial cancelled by user for extension %s", extension)
+			return
+		}
 		ws.WriteJSON(wsMessage{Event: "dial-error", Data: fmt.Sprintf("SIP INVITE failed: %v", err)})
 		return
 	}
