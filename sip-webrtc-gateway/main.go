@@ -129,6 +129,7 @@ type peerState struct {
 	placeholderTrack   *webrtc.TrackLocalStaticRTP // Placeholder track to swap back on hangup (avoids renegotiation)
 	dialCancel         context.CancelFunc          // Cancel an in-progress dial (before call object exists)
 	dialing            bool                        // True when handleDial is running (INVITE in progress)
+	remoteTrack        *webrtc.TrackRemote         // Browser mic track (stored on OnTrack, used by forwardTrackToRTP)
 
 	// CRM fields
 	agentID      int64  // Logged-in agent ID
@@ -462,11 +463,9 @@ InviteLoop:
 			log.Printf("INVITE response: status=%d", res.StatusCode)
 
 			switch {
-			case res.StatusCode == 100:
-				continue // Trying, wait for more
-			case res.StatusCode == 180 || res.StatusCode == 183:
-				// Ringing / Session Progress — keep waiting
-				log.Printf("Remote is ringing (status %d)", res.StatusCode)
+			case res.StatusCode >= 100 && res.StatusCode < 200:
+				// All 1xx are provisional (100 Trying, 180 Ringing, 181 Forwarded, 183 Session Progress, etc.)
+				log.Printf("Provisional response: %d — keep waiting", res.StatusCode)
 				continue
 			case res.StatusCode == 401 || res.StatusCode == 407:
 				// Auth challenge — do digest auth with a new transaction
@@ -834,19 +833,20 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 			if pt >= 200 {
 				continue // skip RTCP Sender Report, Receiver Report, etc.
 			}
-			// Filter comfort noise (PT=13) and telephone-event/DTMF (PT=101 or dynamic 96-127)
-			// These are NOT PCMU audio and cause "ssshhh" static when written to WebRTC track
-			if pt == 13 || pt == 101 || (pt >= 96 && pt != 0) {
+			// Only filter known non-audio payload types:
+			// PT=13 = comfort noise (CN), PT=101 = telephone-event (DTMF)
+			// Do NOT filter dynamic PTs (96-127) — many PBX servers use them for audio codecs
+			if pt == 13 || pt == 101 {
 				continue
 			}
 		}
 
-		// Drop first 10 RTP packets - they often contain ringback tail/noise from PBX
+		// Drop first 3 RTP packets - they may contain ringback tail/noise from PBX
 		// which causes the "ssshhh" static sound at call start
 		pktCount++
-		if pktCount <= 10 {
+		if pktCount <= 3 {
 			if pktCount == 1 {
-				log.Printf("Dropping first 10 RTP packets (noise filter)")
+				log.Printf("Dropping first 3 RTP packets (noise filter)")
 			}
 			continue
 		}
@@ -872,7 +872,11 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 		}
 
 		if pktCount <= 15 || pktCount%500 == 0 {
-			log.Printf("SIP→WebRTC: pkt #%d, %d bytes from %s", pktCount, n, addr)
+			pt := uint8(0)
+			if n >= 2 {
+				pt = buff[1] & 0x7F
+			}
+			log.Printf("SIP→WebRTC: pkt #%d, %d bytes from %s, PT=%d", pktCount, n, addr, pt)
 		}
 
 		if _, err := call.audioTrack.Write(buff[:n]); err != nil {
@@ -886,13 +890,27 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 
 // forwardTrackToRTP reads RTP packets from a WebRTC remote track and sends them to the SIP remote RTP address
 // Uses call.remoteAddr which is updated via RTP latching once the first SIP→RTP packet arrives
-func forwardTrackToRTP(track *webrtc.TrackRemote, call *sipCall) {
+// Stops when ctx is cancelled (call ended)
+func forwardTrackToRTP(ctx context.Context, track *webrtc.TrackRemote, call *sipCall) {
 	buff := make([]byte, 1500)
 	pktCount := 0
 	for {
+		// Check if call has ended
+		select {
+		case <-ctx.Done():
+			log.Printf("WebRTC→SIP forwarding stopped for call %s (%d packets)", call.callID, pktCount)
+			return
+		default:
+		}
+
 		n, _, err := track.Read(buff)
 		if err != nil {
 			log.Printf("WebRTC track read error: %v", err)
+			return
+		}
+
+		// Re-check context after blocking Read
+		if ctx.Err() != nil {
 			return
 		}
 
@@ -934,6 +952,11 @@ func (gw *gateway) endCall(callID string) {
 	for _, peer := range gw.peers {
 		if peer.call != nil && peer.call.callID == callID {
 			peer.call = nil
+			// Drain callReady channel so it's clean for the next call
+			select {
+			case <-peer.callReady:
+			default:
+			}
 			// Replace SIP audio track back with placeholder (no renegotiation needed)
 			if call.audioTrack != nil && peer.placeholderTrack != nil {
 				senders := peer.pc.GetSenders()
@@ -1324,29 +1347,16 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	gw.mu.Unlock()
 
-	// Handle incoming audio track from browser (for outbound calls)
-	// Uses channel signal instead of busy-wait for lower latency and CPU usage
+	// Store incoming audio track from browser for use by forwardTrackToRTP
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		log.Printf("Got remote audio track from browser: Kind=%s, ID=%s", track.Kind(), track.ID())
-
-		for {
-			select {
-			case <-peer.callReady:
-				gw.mu.RLock()
-				call := peer.call
-				gw.mu.RUnlock()
-				if call != nil && call.rtpConn != nil {
-					forwardTrackToRTP(track, call)
-					return
-				}
-			case <-time.After(30 * time.Second):
-				gw.mu.RLock()
-				_, ok := gw.peers[safeWS]
-				gw.mu.RUnlock()
-				if !ok {
-					return
-				}
-			}
+		gw.mu.Lock()
+		peer.remoteTrack = track
+		gw.mu.Unlock()
+		// Signal callReady in case handleDial is waiting for the track
+		select {
+		case peer.callReady <- struct{}{}:
+		default:
 		}
 	})
 
@@ -1624,11 +1634,25 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 	gw.mu.Lock()
 	peer.call = call
 	gw.calls[call.callID] = call
+	remoteTrack := peer.remoteTrack
 	gw.mu.Unlock()
-	select {
-	case peer.callReady <- struct{}{}:
-	default:
-		// Channel already has a signal, no need to block
+
+	// Start WebRTC→SIP forwarding using the browser's mic track
+	// If OnTrack hasn't fired yet, wait briefly for it
+	if remoteTrack == nil {
+		log.Printf("Waiting for browser mic track (OnTrack not yet fired)...")
+		select {
+		case <-peer.callReady:
+			gw.mu.RLock()
+			remoteTrack = peer.remoteTrack
+			gw.mu.RUnlock()
+		case <-time.After(10 * time.Second):
+			log.Printf("Warning: browser mic track not available after 10s — WebRTC→SIP audio may not work")
+		}
+	}
+	if remoteTrack != nil {
+		go forwardTrackToRTP(ctx, remoteTrack, call)
+		log.Printf("WebRTC→SIP forwarding started for call %s", call.callID)
 	}
 
 	ws.WriteJSON(wsMessage{Event: "call-started", Data: extension})
