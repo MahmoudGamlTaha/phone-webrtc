@@ -1619,6 +1619,20 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 	call.agentExt = peer.agentExt
 	call.agentPass = peer.agentSIPPass
 
+	// IMMEDIATELY associate call with peer so handleHangup can find it and send BYE.
+	// This must happen before any other setup to prevent the race where hangup
+	// sees peer.call==nil and fails to send BYE to PBX.
+	call.callLogID = callLogID
+	call.agentID = peer.agentID
+	call.customerID = customerID
+	call.startedAt = time.Now()
+
+	gw.mu.Lock()
+	peer.call = call
+	gw.calls[call.callID] = call
+	remoteTrack := peer.remoteTrack
+	gw.mu.Unlock()
+
 	// Check if user hung up while dialSIP was completing (race between 200 OK and hangup)
 	if dialCtx.Err() != nil {
 		log.Printf("Dial completed but user already hung up — sending BYE immediately")
@@ -1635,7 +1649,19 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 				senders[0].ReplaceTrack(peer.placeholderTrack)
 			}
 		}
+		gw.endCall(call.callID)
 		return
+	}
+
+	// Notify frontend immediately (stops ringback tone)
+	ws.WriteJSON(wsMessage{Event: "call-started", Data: extension})
+	log.Printf("Outbound call to %s established for agent %d", extension, peer.agentID)
+
+	// Update call log to answered
+	if callLogID > 0 {
+		if err := updateCallStatus(callLogID, "answered", 0); err != nil {
+			log.Printf("Warning: failed to update call log: %v", err)
+		}
 	}
 
 	// Send NAT keepalive packets to open the RTP pinhole
@@ -1661,31 +1687,6 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 			}
 		}()
 	}
-
-	// Set CRM fields on call
-	call.callLogID = callLogID
-	call.agentID = peer.agentID
-	call.customerID = customerID
-	call.startedAt = time.Now()
-
-	// Update call log to answered
-	if callLogID > 0 {
-		if err := updateCallStatus(callLogID, "answered", 0); err != nil {
-			log.Printf("Warning: failed to update call log: %v", err)
-		}
-	}
-
-	// Associate call with peer
-	// Also store in global calls map (was previously done in dialSIP)
-	gw.mu.Lock()
-	peer.call = call
-	gw.calls[call.callID] = call
-	remoteTrack := peer.remoteTrack
-	gw.mu.Unlock()
-
-	// Notify frontend immediately (stops ringback tone)
-	ws.WriteJSON(wsMessage{Event: "call-started", Data: extension})
-	log.Printf("Outbound call to %s established for agent %d", extension, peer.agentID)
 
 	// Start WebRTC→SIP forwarding using the browser's mic track
 	// If OnTrack hasn't fired yet, wait in a goroutine so we don't block
@@ -1717,6 +1718,7 @@ func (gw *gateway) handleHangup(peer *peerState) {
 	gw.mu.Lock()
 	call := peer.call
 	peer.call = nil
+	dialing := peer.dialing
 
 	// If a dial is in progress (INVITE not yet completed), cancel it
 	if peer.dialing && peer.dialCancel != nil {
@@ -1727,12 +1729,17 @@ func (gw *gateway) handleHangup(peer *peerState) {
 	}
 	gw.mu.Unlock()
 
+	log.Printf("handleHangup: call=%v, wasDialing=%v", call != nil, dialing)
+
 	if call == nil {
 		// No active call, but we already cancelled any in-progress dial above
 		// Notify browser that call ended
+		log.Printf("handleHangup: no active call found, sending call-ended/cancelled")
 		peer.ws.WriteJSON(wsMessage{Event: "call-ended", Data: "cancelled"})
 		return
 	}
+
+	log.Printf("handleHangup: terminating call %s (outbound=%v)", call.callID, call.isOutbound)
 
 	// Update call log with duration
 	if call.callLogID > 0 && !call.startedAt.IsZero() {
