@@ -241,7 +241,7 @@ func main() {
 					log.Printf("Retransmitted 200 OK received, re-sending ACK")
 					callID := res.CallID()
 					gw.mu.RLock()
-					call, ok := gw.calls[callID.String()]
+					call, ok := gw.calls[callID.Value()]
 					gw.mu.RUnlock()
 					if !ok || !call.isOutbound {
 						return
@@ -442,7 +442,7 @@ InviteLoop:
 		select {
 		case <-ctx.Done():
 			// Context cancelled (user pressed cancel) — send SIP CANCEL to stop the phone ringing
-			log.Printf("INVITE context cancelled, sending CANCEL for Call-ID %s", req.CallID().String())
+			log.Printf("INVITE context cancelled, sending CANCEL for Call-ID %s", req.CallID().Value())
 			cancelReq := sip.NewRequest(sip.CANCEL, reqURI)
 			cancelReq.AppendHeader(req.Via())
 			cancelReq.AppendHeader(req.From())
@@ -520,7 +520,7 @@ InviteLoop:
 
 	cancel()
 
-	callID := req.CallID().String()
+	callID := req.CallID().Value()
 
 	// Extract dialog fields for proper BYE construction
 	fromTagVal := ""
@@ -628,7 +628,7 @@ func (gw *gateway) startSIPServer() {}
 
 // onSIPInvite handles incoming SIP INVITE requests
 func (gw *gateway) onSIPInvite(req *sip.Request, tx sip.ServerTransaction) {
-	callID := req.CallID().String()
+	callID := req.CallID().Value()
 	from := req.From().String()
 
 	log.Printf("Incoming SIP INVITE from %s (Call-ID: %s)", from, callID)
@@ -650,7 +650,7 @@ func (gw *gateway) onSIPInvite(req *sip.Request, tx sip.ServerTransaction) {
 			return r
 		}
 		return '-'
-	}, strings.TrimPrefix(callID, "Call-ID: "))
+	}, callID)
 
 	// Create audio track for SIP→WebRTC direction
 	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
@@ -749,7 +749,7 @@ func (gw *gateway) onSIPInvite(req *sip.Request, tx sip.ServerTransaction) {
 
 // onSIPBye handles SIP BYE requests (call termination)
 func (gw *gateway) onSIPBye(req *sip.Request, tx sip.ServerTransaction) {
-	callID := req.CallID().String()
+	callID := req.CallID().Value()
 	log.Printf("SIP BYE received for Call-ID: %s", callID)
 
 	if err := tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil)); err != nil {
