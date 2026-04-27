@@ -98,6 +98,7 @@ type sipCall struct {
 	from       string
 	to         string
 	isOutbound bool
+	ctx        context.Context
 	cancelFunc context.CancelFunc
 	latched    bool // True after first RTP packet received (remoteAddr is now latched)
 	ringing    bool // True after 180 Ringing received
@@ -707,6 +708,7 @@ func (gw *gateway) onSIPInvite(req *sip.Request, tx sip.ServerTransaction) {
 
 	// Forward RTP packets from SIP to the audio track
 	ctx, cancel := context.WithCancel(context.Background())
+	call.ctx = ctx
 	call.cancelFunc = cancel
 	go gw.forwardRTPToTrack(ctx, call)
 
@@ -1262,16 +1264,8 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create SettingEngine with NAT 1:1 IP mapping so ICE candidates use the server's public IP.
-	// Without this, the server behind NAT advertises its private IP and the browser can't send RTP back.
-	se := webrtc.SettingEngine{}
-	if *publicIP != "" {
-		se.SetNAT1To1IPs([]string{*publicIP}, webrtc.ICECandidateTypeHost)
-		log.Printf("WebRTC NAT1To1 set to: %s", *publicIP)
-	}
-
-	// Create API with custom MediaEngine and SettingEngine
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithSettingEngine(se))
+	// Create API with custom MediaEngine
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
 
 	// Create PeerConnection with STUN for ICE gathering
 	pc, err := api.NewPeerConnection(webrtc.Configuration{
@@ -1355,16 +1349,28 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	gw.mu.Unlock()
 
-	// Store incoming audio track from browser for use by forwardTrackToRTP
+	// Handle incoming audio track from browser — stores it and starts WebRTC→SIP forwarding
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		log.Printf("Got remote audio track from browser: Kind=%s, ID=%s", track.Kind(), track.ID())
+		log.Printf("Got remote audio track from browser: Kind=%s, ID=%s, SSRC=%d", track.Kind(), track.ID(), track.SSRC())
 		gw.mu.Lock()
 		peer.remoteTrack = track
+		call := peer.call
 		gw.mu.Unlock()
+
 		// Signal callReady in case handleDial is waiting for the track
 		select {
 		case peer.callReady <- struct{}{}:
 		default:
+		}
+
+		// If there's already an active call, start forwarding immediately
+		// (handleDial may have missed the track if OnTrack fires late)
+		if call != nil && call.rtpConn != nil && call.cancelFunc != nil {
+			log.Printf("OnTrack: active call found, starting WebRTC→SIP forwarding")
+			forwardTrackToRTP(call.ctx, track, call)
+		} else {
+			// No active call yet — handleDial will start forwarding when the call is ready
+			log.Printf("OnTrack: no active call yet, track stored for handleDial")
 		}
 	})
 
@@ -1564,6 +1570,7 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 	// Start forwarding RTP from SIP to WebRTC track BEFORE INVITE
 	// so packets flow immediately when the PBX starts sending after 200 OK
 	ctx, cancel := context.WithCancel(context.Background())
+	call.ctx = ctx
 	call.cancelFunc = cancel
 	go gw.forwardRTPToTrack(ctx, call)
 

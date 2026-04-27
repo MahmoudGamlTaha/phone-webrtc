@@ -100,46 +100,47 @@ export function connect() {
   }
 }
 
-// ensureMicStream requests microphone and adds the track to the PeerConnection.
-// Must be called BEFORE setRemoteDescription so the track is on the transceiver
-// when createAnswer runs. This is the standard WebRTC answerer pattern.
+// ensureMicStream acquires the microphone and adds the track to the PeerConnection.
+// Uses addTrack so the browser creates a transceiver with our mic attached.
+// Must be called BEFORE setRemoteDescription so createAnswer includes our mic SSRC.
 async function ensureMicStream() {
-  // If we already have a stream, ensure the track is on the current PC
-  if (localStream) {
-    const track = localStream.getAudioTracks()[0];
-    if (track && pc) {
-      // Check if track is already on a sender
-      const senders = pc.getSenders();
-      const alreadyAdded = senders.some(s => s.track && s.track.id === track.id);
-      if (!alreadyAdded) {
-        pc.addTrack(track, localStream);
-        console.log('ensureMicStream: re-added existing mic track to PC, track id=', track.id);
+  // Acquire mic stream (cached after first call)
+  if (!localStream) {
+    if (micPromise) {
+      await micPromise;
+    } else {
+      micPromise = navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      try {
+        localStream = await micPromise;
+        console.log('ensureMicStream: got mic stream, track id=', localStream.getAudioTracks()[0]?.id);
+        emit('mic-ready', '');
+      } catch (err) {
+        emit('mic-error', err.message);
+        console.error('ensureMicStream: getUserMedia failed:', err);
+        micPromise = null;
+        return false;
       }
     }
-    return true;
   }
-  if (micPromise) return micPromise;
-  micPromise = (async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      localStream = stream;
-      const track = stream.getAudioTracks()[0];
-      if (track && pc) {
-        // addTrack creates an audio transceiver with our mic track.
-        // When setRemoteDescription processes the offer, it will match this
-        // transceiver to the offer's audio m-line by kind.
+
+  // Ensure mic track is on the PeerConnection
+  const track = localStream && localStream.getAudioTracks()[0];
+  if (track && pc) {
+    const senders = pc.getSenders();
+    const hasTrack = senders.some(s => s.track && s.track.id === track.id);
+    if (!hasTrack) {
+      // Check if there's an empty sender (from server's sendrecv transceiver) we can use
+      const emptySender = senders.find(s => !s.track || s.track.kind === 'audio');
+      if (emptySender && !emptySender.track) {
+        await emptySender.replaceTrack(track);
+        console.log('ensureMicStream: replaceTrack on empty sender, track id=', track.id);
+      } else {
         pc.addTrack(track, localStream);
-        console.log('ensureMicStream: mic track added via addTrack, track id=', track.id);
+        console.log('ensureMicStream: addTrack, track id=', track.id);
       }
-      emit('mic-ready', '');
-      return true;
-    } catch (err) {
-      emit('mic-error', err.message);
-      micPromise = null;
-      return false;
     }
-  })();
-  return micPromise;
+  }
+  return true;
 }
 
 async function drainIceCandidates() {
