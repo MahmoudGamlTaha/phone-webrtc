@@ -19,6 +19,8 @@ type Agent struct {
 	DisplayName  string `json:"displayName"`
 	Extension    string `json:"extension"`
 	SIPPassword  string `json:"sipPassword"`
+	SIPDomain    string `json:"sipDomain"`
+	SIPServer    string `json:"sipServer"`
 	IsActive     bool   `json:"isActive"`
 	CreatedAt    string `json:"createdAt"`
 }
@@ -90,6 +92,18 @@ func initDB(mysqlDSN string) error {
 	}
 
 	log.Printf("MySQL database initialized: %s", mysqlDSN)
+
+	// Auto-migrate: add sip_domain and sip_server columns if missing
+	migrations := []string{
+		"ALTER TABLE agents ADD COLUMN IF NOT EXISTS sip_domain VARCHAR(255) DEFAULT ''",
+		"ALTER TABLE agents ADD COLUMN IF NOT EXISTS sip_server VARCHAR(255) DEFAULT ''",
+	}
+	for _, m := range migrations {
+		if _, err := db.Exec(m); err != nil {
+			log.Printf("Migration note: %v (may already exist)", err)
+		}
+	}
+
 	return nil
 }
 
@@ -98,9 +112,9 @@ func initDB(mysqlDSN string) error {
 func getAgentByUsername(username string) (*Agent, error) {
 	a := &Agent{}
 	err := db.QueryRow(
-		"SELECT id, username, password_hash, display_name, extension, sip_password, is_active, created_at FROM agents WHERE username = ?",
+		"SELECT id, username, password_hash, display_name, extension, sip_password, sip_domain, sip_server, is_active, created_at FROM agents WHERE username = ?",
 		username,
-	).Scan(&a.ID, &a.Username, &a.PasswordHash, &a.DisplayName, &a.Extension, &a.SIPPassword, &a.IsActive, &a.CreatedAt)
+	).Scan(&a.ID, &a.Username, &a.PasswordHash, &a.DisplayName, &a.Extension, &a.SIPPassword, &a.SIPDomain, &a.SIPServer, &a.IsActive, &a.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -121,9 +135,9 @@ func createAgent(username, passwordHash, displayName, extension string) (int64, 
 func getAgentByID(id int64) (*Agent, error) {
 	a := &Agent{}
 	err := db.QueryRow(
-		"SELECT id, username, password_hash, display_name, extension, sip_password, is_active, created_at FROM agents WHERE id = ?",
+		"SELECT id, username, password_hash, display_name, extension, sip_password, sip_domain, sip_server, is_active, created_at FROM agents WHERE id = ?",
 		id,
-	).Scan(&a.ID, &a.Username, &a.PasswordHash, &a.DisplayName, &a.Extension, &a.SIPPassword, &a.IsActive, &a.CreatedAt)
+	).Scan(&a.ID, &a.Username, &a.PasswordHash, &a.DisplayName, &a.Extension, &a.SIPPassword, &a.SIPDomain, &a.SIPServer, &a.IsActive, &a.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +145,7 @@ func getAgentByID(id int64) (*Agent, error) {
 }
 
 func listAgents() ([]Agent, error) {
-	rows, err := db.Query("SELECT id, username, password_hash, display_name, extension, sip_password, is_active, created_at FROM agents ORDER BY id")
+	rows, err := db.Query("SELECT id, username, password_hash, display_name, extension, sip_password, sip_domain, sip_server, is_active, created_at FROM agents ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +153,7 @@ func listAgents() ([]Agent, error) {
 	var agents []Agent
 	for rows.Next() {
 		var a Agent
-		if err := rows.Scan(&a.ID, &a.Username, &a.PasswordHash, &a.DisplayName, &a.Extension, &a.SIPPassword, &a.IsActive, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Username, &a.PasswordHash, &a.DisplayName, &a.Extension, &a.SIPPassword, &a.SIPDomain, &a.SIPServer, &a.IsActive, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		agents = append(agents, a)
@@ -330,6 +344,15 @@ func updateTask(t *Task) error {
 
 func deleteTask(id int64, agentID int64) error {
 	_, err := db.Exec("DELETE FROM tasks WHERE id=? AND agent_id=?", id, agentID)
+	return err
+}
+
+// updateAgentSIP updates the SIP credentials for an agent
+func updateAgentSIP(agentID int64, extension, sipPassword, sipDomain, sipServer string) error {
+	_, err := db.Exec(
+		"UPDATE agents SET extension=?, sip_password=?, sip_domain=?, sip_server=? WHERE id=?",
+		extension, sipPassword, sipDomain, sipServer, agentID,
+	)
 	return err
 }
 

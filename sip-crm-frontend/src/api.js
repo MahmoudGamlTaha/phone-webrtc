@@ -63,6 +63,11 @@ export const sipConfig = {
   update: (data) => api('/sip-config', { method: 'PUT', body: JSON.stringify(data) }),
 };
 
+export const profileSIP = {
+  get: () => api('/profile'),
+  update: (data) => api('/profile/sip', { method: 'PUT', body: JSON.stringify(data) }),
+};
+
 export const dashboard = {
   stats: () => api('/dashboard'),
 };

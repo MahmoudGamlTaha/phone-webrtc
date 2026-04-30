@@ -41,6 +41,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -104,6 +105,7 @@ type sipCall struct {
 	ringing    bool // True after 180 Ringing received
 
 	// SIP dialog fields for proper BYE construction
+	sipDomain  string  // SIP domain for this call (from agent's DB record)
 	fromTag    string  // From tag from our INVITE
 	toTag      string  // To tag from 200 OK response
 	cseqNo     uint32  // CSeq number from INVITE
@@ -133,10 +135,11 @@ type peerState struct {
 	remoteTrack        *webrtc.TrackRemote         // Browser mic track (stored on OnTrack, used by forwardTrackToRTP)
 
 	// CRM fields
-	agentID      int64  // Logged-in agent ID
-	agentExt     string // Agent's SIP extension
-	agentSIPPass string // Agent's SIP password
-	token        string // Auth token
+	agentID        int64  // Logged-in agent ID
+	agentExt       string // Agent's SIP extension
+	agentSIPPass   string // Agent's SIP password
+	agentSIPDomain string // Agent's SIP domain (from DB, fallback to global flag)
+	token          string // Auth token
 }
 
 // gateway holds all state for the SIP-to-WebRTC bridge
@@ -229,6 +232,27 @@ func main() {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 
+	// Load SIP config from DB (overrides flags if DB has active config)
+	if sipCfg, err := getActiveSIPConfig(); err == nil && sipCfg != nil {
+		if sipCfg.Server != "" && *sipServerAddr == "173.199.70.125:5666" {
+			// Only override default flag value, not user-specified
+			*sipServerAddr = sipCfg.Server
+			parts := strings.SplitN(sipCfg.Server, ":", 2)
+			if *sipDomain == "" || *sipDomain == "173.199.70.125" {
+				*sipDomain = parts[0]
+			}
+			if len(parts) == 2 {
+				if p, err := strconv.Atoi(parts[1]); err == nil {
+					sipServerPort = p
+				}
+			}
+		}
+		if sipCfg.Domain != "" && *sipDomain == "173.199.70.125" {
+			*sipDomain = sipCfg.Domain
+		}
+		log.Printf("SIP config loaded from DB: server=%s domain=%s", sipCfg.Server, sipCfg.Domain)
+	}
+
 	gw := newGateway()
 
 	// Create a shared SIP UA (client + server use same socket/port)
@@ -309,6 +333,19 @@ func main() {
 		log.Printf("SIP client not configured (need -sip-server, -sip-username, -sip-password). Only inbound calls will work.")
 	}
 
+	// Start periodic health logging (detect resource leaks over time)
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			gw.mu.RLock()
+			peers := len(gw.peers)
+			calls := len(gw.calls)
+			gw.mu.RUnlock()
+			log.Printf("HEALTH: peers=%d calls=%d goroutines=%d", peers, calls, runtime.NumGoroutine())
+		}
+	}()
+
 	// Start HTTP/WebSocket server (blocks)
 	gw.startHTTPServer()
 }
@@ -382,7 +419,7 @@ func (gw *gateway) registerSIP() error {
 }
 
 // dialSIP sends an INVITE to the PBX for a target extension using the given agent credentials
-func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRTPPort int, agentExt, agentSIPPass string, parentCtx context.Context) (*sipCall, error) {
+func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRTPPort int, agentExt, agentSIPPass, sipDomain string, parentCtx context.Context) (*sipCall, error) {
 	ctx, cancel := context.WithTimeout(parentCtx, 60*time.Second)
 
 	// Build SDP offer for the INVITE
@@ -395,16 +432,16 @@ func (gw *gateway) dialSIP(ws *threadSafeWriter, targetExtension string, localRT
 	log.Printf("SDP offer for INVITE (%d bytes, publicIP=%s, rtpPort=%d): %s", len(sdpBytes), *publicIP, localRTPPort, string(sdpBytes))
 
 	// Build INVITE request using agent's extension as From
-	reqURI := sip.Uri{User: targetExtension, Host: *sipDomain, Port: sipServerPort}
+	reqURI := sip.Uri{User: targetExtension, Host: sipDomain, Port: sipServerPort}
 	fromHdr := sip.FromHeader{
 		DisplayName: agentExt,
-		Address:     sip.Uri{User: agentExt, Host: *sipDomain, Port: sipServerPort},
+		Address:     sip.Uri{User: agentExt, Host: sipDomain, Port: sipServerPort},
 		Params:      sip.NewParams(),
 	}
 	fromHdr.Params.Add("tag", "pion-gw-"+fmt.Sprintf("%d", time.Now().UnixNano()))
 
 	toHdr := sip.ToHeader{
-		Address: sip.Uri{User: targetExtension, Host: *sipDomain, Port: sipServerPort},
+		Address: sip.Uri{User: targetExtension, Host: sipDomain, Port: sipServerPort},
 	}
 
 	contactHdr := &sip.ContactHeader{
@@ -533,7 +570,7 @@ InviteLoop:
 			toTagVal = tt
 		}
 	}
-	contactURI := sip.Uri{User: targetExtension, Host: *sipDomain, Port: sipServerPort}
+	contactURI := sip.Uri{User: targetExtension, Host: sipDomain, Port: sipServerPort}
 	if contact := res.Contact(); contact != nil {
 		contactURI = contact.Address
 	}
@@ -574,7 +611,7 @@ func (gw *gateway) sendSIPBye(call *sipCall) error {
 	reqURI := call.contactURI
 
 	fromHdr := sip.FromHeader{
-		Address: sip.Uri{User: call.agentExt, Host: *sipDomain, Port: sipServerPort},
+		Address: sip.Uri{User: call.agentExt, Host: call.sipDomain, Port: sipServerPort},
 		Params:  sip.NewParams(),
 	}
 	if call.fromTag != "" {
@@ -582,7 +619,7 @@ func (gw *gateway) sendSIPBye(call *sipCall) error {
 	}
 
 	toHdr := sip.ToHeader{
-		Address: sip.Uri{User: call.to, Host: *sipDomain, Port: sipServerPort},
+		Address: sip.Uri{User: call.to, Host: call.sipDomain, Port: sipServerPort},
 		Params:  sip.NewParams(),
 	}
 	if call.toTag != "" {
@@ -702,8 +739,9 @@ func (gw *gateway) onSIPInvite(req *sip.Request, tx sip.ServerTransaction) {
 		audioTrack: audioTrack,
 
 		// Dialog fields for BYE (inbound: we are UAS, caller is UAC)
-		fromTag:    inToTag,   // Our tag (the To tag we assigned in 200 OK)
-		toTag:      inFromTag, // Caller's tag (the From tag from INVITE)
+		sipDomain:  *sipDomain, // Use global for inbound (no specific agent yet)
+		fromTag:    inToTag,    // Our tag (the To tag we assigned in 200 OK)
+		toTag:      inFromTag,  // Caller's tag (the From tag from INVITE)
 		cseqNo:     inCseqNo,
 		contactURI: inContactURI,
 		agentExt:   inFromUser, // Our side (the To party of the INVITE)
@@ -721,6 +759,29 @@ func (gw *gateway) onSIPInvite(req *sip.Request, tx sip.ServerTransaction) {
 	call.ctx = ctx
 	call.cancelFunc = cancel
 	go gw.forwardRTPToTrack(ctx, call)
+
+	// Send periodic NAT keepalive packets throughout the entire call
+	if call.sdpAddr != nil {
+		go func() {
+			keepalive := []byte{0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					dest := call.remoteAddr
+					if dest == nil {
+						dest = call.sdpAddr
+					}
+					if _, err := rtpConn.WriteToUDP(keepalive, dest); err != nil {
+						return
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 
 	// Send call-started event to all connected browsers
 	gw.broadcastToPeers(wsMessage{Event: "call-started", Data: from})
@@ -815,6 +876,7 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 	pktCount := 0
 	var lastSeq uint16
 	seqInit := false
+	lastPacketTime := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -823,12 +885,18 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 		default:
 		}
 
-		// Set read deadline so we can check context cancellation
+		// Set read deadline so we can check context cancellation and detect timeouts
 		call.rtpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
 
 		n, addr, err := call.rtpConn.ReadFromUDP(buff)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Check for RTP timeout — if no packets for 30s, NAT mapping may have expired
+				if time.Since(lastPacketTime) > 30*time.Second {
+					log.Printf("WARNING: No RTP packets for 30s on call %s — NAT mapping may have expired, resetting latch", call.callID)
+					call.latched = false
+					lastPacketTime = time.Now() // reset to avoid spamming
+				}
 				continue
 			}
 			if ctx.Err() != nil {
@@ -837,6 +905,8 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 			log.Printf("RTP read error for call %s: %v", call.callID, err)
 			return
 		}
+
+		lastPacketTime = time.Now()
 
 		// Filter out RTCP packets (payload type >= 200 in byte 1 low 7 bits)
 		// RTCP mixed with RTP on the same port causes choppy/corrupted audio
@@ -907,22 +977,22 @@ func forwardTrackToRTP(ctx context.Context, track *webrtc.TrackRemote, call *sip
 	buff := make([]byte, 1500)
 	pktCount := 0
 	for {
-		// Check if call has ended
-		select {
-		case <-ctx.Done():
+		// Check if call has ended before attempting read
+		if ctx.Err() != nil {
 			log.Printf("WebRTC→SIP forwarding stopped for call %s (%d packets)", call.callID, pktCount)
 			return
-		default:
 		}
 
 		n, _, err := track.Read(buff)
 		if err != nil {
-			log.Printf("WebRTC track read error: %v", err)
-			return
-		}
-
-		// Re-check context after blocking Read
-		if ctx.Err() != nil {
+			// When the PeerConnection is closed (endCall/removePeer), track.Read returns an error.
+			// Check context first — if cancelled, this is a clean shutdown.
+			if ctx.Err() != nil {
+				log.Printf("WebRTC→SIP forwarding stopped for call %s (%d packets)", call.callID, pktCount)
+				return
+			}
+			// Otherwise it's a real track error
+			log.Printf("WebRTC track read error for call %s: %v", call.callID, err)
 			return
 		}
 
@@ -1377,7 +1447,7 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		// (handleDial may have missed the track if OnTrack fires late)
 		if call != nil && call.rtpConn != nil && call.cancelFunc != nil {
 			log.Printf("OnTrack: active call found, starting WebRTC→SIP forwarding")
-			forwardTrackToRTP(call.ctx, track, call)
+			go forwardTrackToRTP(call.ctx, track, call)
 		} else {
 			// No active call yet — handleDial will start forwarding when the call is ready
 			log.Printf("OnTrack: no active call yet, track stored for handleDial")
@@ -1461,9 +1531,13 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			peer.agentID = agent.ID
 			peer.agentExt = agent.Extension
 			peer.agentSIPPass = agent.SIPPassword
+			peer.agentSIPDomain = agent.SIPDomain
+			if peer.agentSIPDomain == "" {
+				peer.agentSIPDomain = *sipDomain // fallback to global flag
+			}
 			peer.token = token
-			log.Printf("WebSocket authenticated: agent=%s ext=%s", agent.Username, agent.Extension)
-			safeWS.WriteJSON(wsMessage{Event: "auth-ok", Data: fmt.Sprintf("%s:%s", agent.Username, agent.Extension)})
+			log.Printf("WebSocket authenticated: agent=%s ext=%s sipDomain=%s", agent.Username, agent.Extension, peer.agentSIPDomain)
+			safeWS.WriteJSON(wsMessage{Event: "auth-ok", Data: fmt.Sprintf("%s:%s:%s", agent.Username, agent.Extension, peer.agentSIPDomain)})
 
 		case "dial":
 			// Browser wants to make an outbound SIP call
@@ -1586,7 +1660,7 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 
 	// Send INVITE to PBX using agent's SIP credentials (blocks until 200 OK or error)
 	// Uses dialCtx so hangup during dial cancels the INVITE
-	sipCall, err := gw.dialSIP(ws, extension, rtpPort, peer.agentExt, peer.agentSIPPass, dialCtx)
+	sipCall, err := gw.dialSIP(ws, extension, rtpPort, peer.agentExt, peer.agentSIPPass, peer.agentSIPDomain, dialCtx)
 	if err != nil {
 		cancel()
 		// Swap back to placeholder track since dial failed
@@ -1618,6 +1692,7 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 	call.contactURI = sipCall.contactURI
 	call.agentExt = peer.agentExt
 	call.agentPass = peer.agentSIPPass
+	call.sipDomain = peer.agentSIPDomain
 
 	// IMMEDIATELY associate call with peer so handleHangup can find it and send BYE.
 	// This must happen before any other setup to prevent the race where hangup
@@ -1664,21 +1739,22 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 		}
 	}
 
-	// Send NAT keepalive packets to open the RTP pinhole
-	// The PBX needs to receive a packet from us first so its NAT/firewall allows return traffic
+	// Send periodic NAT keepalive packets throughout the entire call
+	// NAT mappings can expire (30s-5min), causing the PBX to stop sending RTP back.
+	// Persistent keepalive keeps the NAT pinhole open for the full call duration.
 	if call.sdpAddr != nil {
 		go func() {
-			// Empty RTP packet (minimal valid header: version=2, PT=0/PCMU, seq=0, ts=0, ssrc=0)
 			keepalive := []byte{0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-			ticker := time.NewTicker(500 * time.Millisecond)
+			ticker := time.NewTicker(15 * time.Second)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ticker.C:
-					if call.latched {
-						return // RTP flow established, no more keepalives needed
+					dest := call.remoteAddr
+					if dest == nil {
+						dest = call.sdpAddr
 					}
-					if _, err := rtpConn.WriteToUDP(keepalive, call.sdpAddr); err != nil {
+					if _, err := rtpConn.WriteToUDP(keepalive, dest); err != nil {
 						return
 					}
 				case <-ctx.Done():

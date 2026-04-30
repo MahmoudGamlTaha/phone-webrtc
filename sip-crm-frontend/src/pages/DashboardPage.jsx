@@ -1,10 +1,10 @@
 import { useState, useEffect, useCallback } from 'react'
-import { customers, calls, tasks, dashboard } from '../api'
+import { customers, calls, tasks, dashboard, profileSIP, sipConfig } from '../api'
 import * as sip from '../sip'
 import {
   Phone, PhoneOff, Users, ListTodo, LogOut, Plus, X, User, Clock,
   CheckCircle, AlertCircle, PhoneCall, Headphones, TrendingUp,
-  Target, MinusCircle, LayoutDashboard
+  Target, MinusCircle, LayoutDashboard, Settings, Save, Server, Globe, Key
 } from 'lucide-react'
 
 function CustomerModal({ customer, onClose, onSave }) {
@@ -94,6 +94,118 @@ function TasksView({ taskList, onToggle, onRefresh }) {
   )
 }
 
+function SIPSettingsTab({ agent }) {
+  const [agentForm, setAgentForm] = useState({ extension: '', sipPassword: '', sipDomain: '', sipServer: '' })
+  const [globalForm, setGlobalForm] = useState({ id: 0, server: '', domain: '', isActive: true })
+  const [saving, setSaving] = useState(false)
+  const [msg, setMsg] = useState('')
+  const [loaded, setLoaded] = useState(false)
+
+  useEffect(() => {
+    profileSIP.get().then(p => {
+      setAgentForm({ extension: p.extension || '', sipPassword: p.sipPassword || '', sipDomain: p.sipDomain || '', sipServer: p.sipServer || '' })
+    }).catch(() => {})
+    sipConfig.get().then(c => {
+      setGlobalForm({ id: c.id || 0, server: c.server || '', domain: c.domain || '', isActive: c.isActive !== false })
+      setLoaded(true)
+    }).catch(() => { setLoaded(true) })
+  }, [])
+
+  const saveAgent = async () => {
+    setSaving(true); setMsg('')
+    try {
+      await profileSIP.update(agentForm)
+      setMsg('SIP settings saved — reconnect to apply')
+    } catch (err) { setMsg('Error: ' + err.message) }
+    setSaving(false)
+  }
+
+  const saveGlobal = async () => {
+    setSaving(true); setMsg('')
+    try {
+      await sipConfig.update(globalForm)
+      setMsg('Global SIP config saved')
+    } catch (err) { setMsg('Error: ' + err.message) }
+    setSaving(false)
+  }
+
+  return (
+    <div className="p-6 space-y-6 max-w-2xl">
+      <h2 className="text-2xl font-bold flex items-center gap-2"><Settings className="w-6 h-6 text-slate-400" /> SIP Settings</h2>
+
+      {msg && (
+        <div className={`px-4 py-3 rounded-lg text-sm ${msg.startsWith('Error') ? 'bg-red-500/10 text-red-400 border border-red-500/20' : 'bg-green-500/10 text-green-400 border border-green-500/20'}`}>
+          {msg}
+        </div>
+      )}
+
+      {/* Agent SIP Settings */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl">
+        <div className="p-4 border-b border-slate-800">
+          <h3 className="font-semibold flex items-center gap-2"><Key className="w-4 h-4 text-amber-400" /> Your SIP Credentials</h3>
+          <p className="text-xs text-slate-500 mt-1">These settings are used when you make calls. Reconnect after saving to apply.</p>
+        </div>
+        <div className="p-4 space-y-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-1 flex items-center gap-1"><Phone className="w-3 h-3" /> Extension</label>
+              <input type="text" value={agentForm.extension} onChange={e => setAgentForm({ ...agentForm, extension: e.target.value })}
+                placeholder="e.g. 5000" className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-1 flex items-center gap-1"><Key className="w-3 h-3" /> SIP Password</label>
+              <input type="password" value={agentForm.sipPassword} onChange={e => setAgentForm({ ...agentForm, sipPassword: e.target.value })}
+                placeholder="SIP auth password" className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-1 flex items-center gap-1"><Globe className="w-3 h-3" /> SIP Domain</label>
+              <input type="text" value={agentForm.sipDomain} onChange={e => setAgentForm({ ...agentForm, sipDomain: e.target.value })}
+                placeholder="e.g. 173.199.70.125" className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-1 flex items-center gap-1"><Server className="w-3 h-3" /> SIP Server</label>
+              <input type="text" value={agentForm.sipServer} onChange={e => setAgentForm({ ...agentForm, sipServer: e.target.value })}
+                placeholder="e.g. 173.199.70.125:5666" className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" />
+            </div>
+          </div>
+          <button onClick={saveAgent} disabled={saving}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2">
+            <Save className="w-4 h-4" /> {saving ? 'Saving...' : 'Save SIP Settings'}
+          </button>
+        </div>
+      </div>
+
+      {/* Global SIP Config */}
+      {loaded && (
+        <div className="bg-slate-900 border border-slate-800 rounded-xl">
+          <div className="p-4 border-b border-slate-800">
+            <h3 className="font-semibold flex items-center gap-2"><Server className="w-4 h-4 text-blue-400" /> Global SIP Server Config</h3>
+            <p className="text-xs text-slate-500 mt-1">Default SIP server settings for all agents. Individual agent settings override these.</p>
+          </div>
+          <div className="p-4 space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-300 mb-1 flex items-center gap-1"><Server className="w-3 h-3" /> Server Address</label>
+                <input type="text" value={globalForm.server} onChange={e => setGlobalForm({ ...globalForm, server: e.target.value })}
+                  placeholder="host:port" className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-300 mb-1 flex items-center gap-1"><Globe className="w-3 h-3" /> Domain</label>
+                <input type="text" value={globalForm.domain} onChange={e => setGlobalForm({ ...globalForm, domain: e.target.value })}
+                  placeholder="SIP domain" className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-lg text-sm text-white focus:ring-2 focus:ring-blue-500 outline-none" />
+              </div>
+            </div>
+            <button onClick={saveGlobal} disabled={saving}
+              className="px-4 py-2 bg-slate-700 text-white rounded-lg text-sm font-medium hover:bg-slate-600 disabled:opacity-50 flex items-center gap-2">
+              <Save className="w-4 h-4" /> {saving ? 'Saving...' : 'Save Global Config'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function DashboardPage({ agent, onLogout }) {
   const [callStatus, setCallStatus] = useState('idle')
   const [currentExt, setCurrentExt] = useState('')
@@ -147,6 +259,7 @@ export default function DashboardPage({ agent, onLogout }) {
     { id: 'calls', icon: PhoneCall, label: 'Call Board' },
     { id: 'tasks', icon: ListTodo, label: 'Tasks' },
     { id: 'recommendations', icon: TrendingUp, label: 'Recommendations' },
+    { id: 'settings', icon: Settings, label: 'SIP Settings' },
   ]
 
   return (
@@ -348,6 +461,8 @@ export default function DashboardPage({ agent, onLogout }) {
             <p className="text-slate-600 text-xs text-center">Recommendations are for informational purposes only and do not constitute financial advice.</p>
           </div>
         )}
+
+        {activeTab === 'settings' && <SIPSettingsTab agent={agent} />}
       </main>
 
       {/* Customer Modal */}

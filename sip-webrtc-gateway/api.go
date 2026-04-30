@@ -200,8 +200,31 @@ func handleGetProfile(w http.ResponseWriter, r *http.Request) {
 		"username":    agent.Username,
 		"displayName": agent.DisplayName,
 		"extension":   agent.Extension,
+		"sipPassword": agent.SIPPassword,
+		"sipDomain":   agent.SIPDomain,
+		"sipServer":   agent.SIPServer,
 		"isActive":    agent.IsActive,
 	})
+}
+
+func handleUpdateProfileSIP(w http.ResponseWriter, r *http.Request) {
+	agentID, _ := strconv.ParseInt(r.Header.Get("X-Agent-ID"), 10, 64)
+	var req struct {
+		Extension   string `json:"extension"`
+		SIPPassword string `json:"sipPassword"`
+		SIPDomain   string `json:"sipDomain"`
+		SIPServer   string `json:"sipServer"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if err := updateAgentSIP(agentID, req.Extension, req.SIPPassword, req.SIPDomain, req.SIPServer); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	log.Printf("Agent %d SIP settings updated: ext=%s domain=%s server=%s", agentID, req.Extension, req.SIPDomain, req.SIPServer)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
 // --- Customer handlers ---
@@ -431,6 +454,13 @@ func registerAPIRoutes(mux *http.ServeMux) {
 
 	// Profile
 	mux.HandleFunc("/api/profile", authMiddleware(handleGetProfile))
+	mux.HandleFunc("/api/profile/sip", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			handleUpdateProfileSIP(w, r)
+		} else {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
 
 	// Customers
 	mux.HandleFunc("/api/customers", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
