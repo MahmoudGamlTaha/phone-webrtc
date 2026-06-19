@@ -414,15 +414,28 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 	req.AppendHeader(&contentTypeHeaderSDP)
 	req.SetBody(sdpBytes)
 
+	// Log full INVITE request for debugging
+	log.Printf("FULL INVITE request:\n%s", req.String())
+
 	// Send INVITE
 	res, err := gw.sipClient.Do(ctx, req)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("INVITE request: %w", err)
 	}
+	log.Printf("INVITE initial response: status=%d reason=%s", res.StatusCode, res.Reason)
 
 	// Handle 401/407 digest auth using gateway's registered credentials
 	if res.StatusCode == 401 || res.StatusCode == 407 {
+		// Log auth challenge headers for debugging
+		log.Printf("Auth challenge response headers:")
+		for _, h := range res.GetHeaders("WWW-Authenticate") {
+			log.Printf("  WWW-Authenticate: %s", h.Value())
+		}
+		for _, h := range res.GetHeaders("Proxy-Authenticate") {
+			log.Printf("  Proxy-Authenticate: %s", h.Value())
+		}
+
 		res, err = gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
 			Username: *sipUsername,
 			Password: *sipPassword,
@@ -431,12 +444,14 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 			cancel()
 			return nil, fmt.Errorf("INVITE digest auth: %w", err)
 		}
+		log.Printf("INVITE after digest auth: status=%d reason=%s", res.StatusCode, res.Reason)
 	}
 
-	// sipgo Do() skips provisional responses (180 Ringing) and returns the final response
+	// Log full response for non-200 to diagnose failures
 	if res.StatusCode != 200 {
+		log.Printf("INVITE FAILED - full response:\n%s", res.String())
 		cancel()
-		return nil, fmt.Errorf("INVITE failed with status %d", res.StatusCode)
+		return nil, fmt.Errorf("INVITE failed with status %d %s", res.StatusCode, res.Reason)
 	}
 
 	// Send ACK for 2xx (must use res.To() with remote tag, route to Contact URI from 200 OK)
