@@ -373,7 +373,8 @@ func (gw *gateway) registerSIP() error {
 	return nil
 }
 
-// dialSIP sends an INVITE to the PBX for a target extension using the given agent credentials
+// dialSIP sends an INVITE to the PBX for a target extension using the gateway's registered SIP credentials.
+// The agentExt is kept for CRM tracking but SIP signaling uses the registered trunk extension.
 func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, agentSIPPass string) (*sipCall, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 
@@ -386,11 +387,14 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 	}
 	log.Printf("SDP offer for INVITE (%d bytes, publicIP=%s, rtpPort=%d): %s", len(sdpBytes), *publicIP, localRTPPort, string(sdpBytes))
 
-	// Build INVITE request using agent's extension as From
+	// Use gateway's registered SIP credentials for From/Contact headers.
+	// The PBX only accepts INVITEs from registered contacts — the gateway
+	// registers as sipUsername, so INVITEs must also come from sipUsername.
+	// Agent extension is preserved in DisplayName for CRM tracking.
 	reqURI := sip.Uri{User: targetExtension, Host: *sipDomain, Port: sipServerPort}
 	fromHdr := sip.FromHeader{
 		DisplayName: agentExt,
-		Address:     sip.Uri{User: agentExt, Host: *sipDomain, Port: sipServerPort},
+		Address:     sip.Uri{User: *sipUsername, Host: *sipDomain, Port: sipServerPort},
 		Params:      sip.NewParams(),
 	}
 	fromHdr.Params.Add("tag", "pion-gw-"+fmt.Sprintf("%d", time.Now().UnixNano()))
@@ -400,7 +404,7 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 	}
 
 	contactHdr := &sip.ContactHeader{
-		Address: sip.Uri{User: agentExt, Host: *publicIP, Port: *sipListenPort},
+		Address: sip.Uri{User: *sipUsername, Host: *publicIP, Port: *sipListenPort},
 	}
 
 	req := sip.NewRequest(sip.INVITE, reqURI)
@@ -417,11 +421,11 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 		return nil, fmt.Errorf("INVITE request: %w", err)
 	}
 
-	// Handle 401/407 digest auth using agent's credentials
+	// Handle 401/407 digest auth using gateway's registered credentials
 	if res.StatusCode == 401 || res.StatusCode == 407 {
 		res, err = gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
-			Username: agentExt,
-			Password: agentSIPPass,
+			Username: *sipUsername,
+			Password: *sipPassword,
 		})
 		if err != nil {
 			cancel()
@@ -519,7 +523,7 @@ func (gw *gateway) sendSIPBye(call *sipCall) error {
 	reqURI := call.contactURI
 
 	fromHdr := sip.FromHeader{
-		Address: sip.Uri{User: call.agentExt, Host: *sipDomain, Port: sipServerPort},
+		Address: sip.Uri{User: *sipUsername, Host: *sipDomain, Port: sipServerPort},
 		Params:  sip.NewParams(),
 	}
 	if call.fromTag != "" {
@@ -549,11 +553,11 @@ func (gw *gateway) sendSIPBye(call *sipCall) error {
 		return fmt.Errorf("BYE request: %w", err)
 	}
 
-	// Handle digest auth for BYE using agent credentials
+	// Handle digest auth for BYE using gateway's registered credentials
 	if res.StatusCode == 401 || res.StatusCode == 407 {
 		res, err = gw.sipClient.DoDigestAuth(ctx, req, res, sipgo.DigestAuth{
-			Username: call.agentExt,
-			Password: call.agentPass,
+			Username: *sipUsername,
+			Password: *sipPassword,
 		})
 		if err != nil {
 			return fmt.Errorf("BYE digest auth: %w", err)
