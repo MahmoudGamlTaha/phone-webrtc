@@ -120,9 +120,10 @@ type peerState struct {
 	ws                 *threadSafeWriter
 	pc                 *webrtc.PeerConnection
 	call               *sipCall
-	negotiateMu        sync.Mutex // Prevents concurrent renegotiation
-	negotiating        bool       // True when an offer/answer exchange is in progress
-	pendingRenegotiate bool       // True if renegotiation was requested while already negotiating
+	browserTrack       *webrtc.TrackRemote // Browser's outgoing audio track (mic)
+	negotiateMu        sync.Mutex          // Prevents concurrent renegotiation
+	negotiating        bool                // True when an offer/answer exchange is in progress
+	pendingRenegotiate bool                // True if renegotiation was requested while already negotiating
 
 	// CRM fields
 	agentID      int64  // Logged-in agent ID
@@ -722,6 +723,7 @@ func startRTPListener() (*net.UDPConn, int, error) {
 // forwardRTPToTrack reads RTP packets from SIP and writes them to the WebRTC audio track
 // Implements RTP latching: updates remoteAddr from actual incoming packet source (handles NAT)
 func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
+	log.Printf("SIP→WebRTC forwarder started for call %s (sdpAddr=%v, rtpConn=%v)", call.callID, call.sdpAddr, call.rtpConn)
 	buff := make([]byte, 1500)
 	pktCount := 0
 	for {
@@ -767,8 +769,9 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 }
 
 // forwardTrackToRTP reads RTP packets from a WebRTC remote track and sends them to the SIP remote RTP address
-// Uses call.remoteAddr which is updated via RTP latching once the first SIP→RTP packet arrives
+// Uses call.remoteAddr (latched) if available, otherwise falls back to SDP address
 func forwardTrackToRTP(track *webrtc.TrackRemote, call *sipCall) {
+	log.Printf("WebRTC→SIP forwarder started (trackID=%s, sdpAddr=%v, remoteAddr=%v)", track.ID(), call.sdpAddr, call.remoteAddr)
 	buff := make([]byte, 1500)
 	pktCount := 0
 	for {
@@ -786,7 +789,7 @@ func forwardTrackToRTP(track *webrtc.TrackRemote, call *sipCall) {
 
 		pktCount++
 		if pktCount <= 5 || pktCount%500 == 0 {
-			log.Printf("WebRTC→SIP: pkt #%d, %d bytes to %s (latched=%v)", pktCount, n, dest, call.latched)
+			log.Printf("WebRTC→SIP: pkt #%d, %d bytes to %s (latched=%v, sdpAddr=%v)", pktCount, n, dest, call.latched, call.sdpAddr)
 		}
 
 		if dest != nil {
@@ -1164,26 +1167,19 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Handle incoming audio track from browser (for outbound calls)
+	// Store the track on peerState so handleDial can start forwarding when the call is established
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		log.Printf("Got remote audio track from browser: Kind=%s, ID=%s", track.Kind(), track.ID())
+		log.Printf("Got remote audio track from browser: Kind=%s, ID=%s, SSRC=%d", track.Kind(), track.ID(), track.SSRC())
 
-		// Wait until this peer has an active outbound SIP call with a remote RTP address
-		for {
-			gw.mu.RLock()
-			peer, ok := gw.peers[safeWS]
-			if !ok {
-				gw.mu.RUnlock()
-				return
+		gw.mu.Lock()
+		if p, ok := gw.peers[safeWS]; ok {
+			p.browserTrack = track
+			// If call already active, start forwarding immediately
+			if p.call != nil && p.call.rtpConn != nil {
+				go forwardTrackToRTP(track, p.call)
 			}
-			if peer.call != nil && peer.call.rtpConn != nil {
-				call := peer.call
-				gw.mu.RUnlock()
-				forwardTrackToRTP(track, call)
-				return
-			}
-			gw.mu.RUnlock()
-			time.Sleep(100 * time.Millisecond)
 		}
+		gw.mu.Unlock()
 	})
 
 	// Register the peer
@@ -1441,9 +1437,15 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 		}
 	}
 
-	// Associate call with peer
+	// Associate call with peer and start browser→SIP forwarding
 	gw.mu.Lock()
 	peer.call = call
+	// Start forwarding browser audio to SIP if we already have the browser's track
+	if peer.browserTrack != nil {
+		go forwardTrackToRTP(peer.browserTrack, call)
+	} else {
+		log.Printf("WARNING: no browserTrack yet for peer, browser→SIP audio will start when track arrives")
+	}
 	gw.mu.Unlock()
 
 	ws.WriteJSON(wsMessage{Event: "call-started", Data: extension})
