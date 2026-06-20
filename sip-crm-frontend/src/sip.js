@@ -60,6 +60,7 @@ export function connect() {
   // Create WebRTC PeerConnection - backend is the offerer, we are the answerer
   pc = new RTCPeerConnection({
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    sdpSemantics: 'unified-plan',
   });
 
   // Do NOT addTransceiver here - ensureMicStream uses addTrack instead, which
@@ -108,6 +109,22 @@ async function ensureMicStream() {
         // transceiver to the offer's audio m-line by kind.
         pc.addTrack(track, stream);
         console.log('ensureMicStream: mic track added via addTrack, track id=', track.id);
+
+        // Force PCMU codec to match SIP/PBX (gateway only supports PCMU)
+        // Must be called after addTrack creates the transceiver
+        const transceivers = pc.getTransceivers();
+        for (const t of transceivers) {
+          if (t.receiver && t.receiver.track && t.receiver.track.kind === 'audio') {
+            const codecs = t.receiver.getParameters().codecs || [];
+            const pcmuCodecs = codecs.filter(c => c.mimeType === 'audio/PCMU');
+            if (pcmuCodecs.length > 0) {
+              t.setCodecPreferences(pcmuCodecs);
+              console.log('setCodecPreferences: forced PCMU-only, codecs=', pcmuCodecs);
+            } else {
+              console.warn('No PCMU codec found in transceiver, available:', codecs.map(c => c.mimeType));
+            }
+          }
+        }
       }
       emit('mic-ready', '');
       return true;

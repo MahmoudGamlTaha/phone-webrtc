@@ -460,7 +460,7 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 	ackReqURI := reqURI // default
 	if contact := res.Contact(); contact != nil {
 		ackReqURI = contact.Address
-		log.Printf("ACK routing to Contact URI: %s", ackReqURI)
+		log.Printf("ACK routing to Contact URI: %v", ackReqURI)
 	}
 	ackReq := sip.NewRequest(sip.ACK, ackReqURI)
 	ackReq.AppendHeader(req.Via())
@@ -469,7 +469,7 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 	ackReq.AppendHeader(req.CallID())
 	ackReq.AppendHeader(sip.NewHeader("CSeq", fmt.Sprintf("%d ACK", req.CSeq().SeqNo)))
 	ackReq.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
-	log.Printf("Sending ACK for INVITE to %s (To tag from response)", ackReqURI)
+	log.Printf("Sending ACK for INVITE to %v (To tag from response)", ackReqURI)
 	if err := gw.sipClient.WriteRequest(ackReq); err != nil {
 		log.Printf("Failed to send ACK: %v", err)
 	}
@@ -1128,7 +1128,7 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Add sendrecv audio transceiver - sender has nil track initially.
 	// handleDial will use ReplaceTrack to put the real SIP audio track on this sender.
-	// This ensures ONE audio m-line with a=sendrecv in the offer.
+	// Browser also adds a sendrecv transceiver — unified-plan merges them into one m-line.
 	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionSendrecv,
 	}); err != nil {
@@ -1405,6 +1405,11 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 	// Start forwarding RTP from SIP to WebRTC track
 	go gw.forwardRTPToTrack(ctx, call)
 
+	// Associate call with peer BEFORE ReplaceTrack+renegotiate so OnTrack can find it
+	gw.mu.Lock()
+	peer.call = call
+	gw.mu.Unlock()
+
 	// Replace the track on the existing sendrecv transceiver's sender.
 	// First call: sender has nil track (from AddTransceiverFromKind on connect).
 	// Subsequent calls: sender has track from previous call.
@@ -1437,10 +1442,8 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 		}
 	}
 
-	// Associate call with peer and start browser→SIP forwarding
+	// Start browser→SIP forwarding if we have the browser's track
 	gw.mu.Lock()
-	peer.call = call
-	// Start forwarding browser audio to SIP if we already have the browser's track
 	if peer.browserTrack != nil {
 		go forwardTrackToRTP(peer.browserTrack, call)
 	} else {
