@@ -317,8 +317,9 @@ func (gw *gateway) startSIPRegistration() {
 		}
 		log.Printf("SIP registered as %s@%s", *sipUsername, *sipDomain)
 
-		// Re-register before expiry (default 3600s, re-register at 3000s)
-		time.Sleep(3000 * time.Second)
+		// Re-register before expiry (every 10 minutes to be safe)
+		// Some PBXes have shorter expiry than the requested 3600s
+		time.Sleep(600 * time.Second)
 	}
 }
 
@@ -414,6 +415,8 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 	req.AppendHeader(&toHdr)
 	req.AppendHeader(contactHdr)
 	req.AppendHeader(&contentTypeHeaderSDP)
+	req.AppendHeader(sip.NewHeader("Max-Forwards", "70"))
+	req.AppendHeader(sip.NewHeader("Allow", "INVITE, ACK, CANCEL, BYE, UPDATE"))
 	req.SetBody(sdpBytes)
 
 	// Log full INVITE request for debugging
@@ -426,6 +429,22 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 		return nil, fmt.Errorf("INVITE request: %w", err)
 	}
 	log.Printf("INVITE initial response: status=%d reason=%s", res.StatusCode, res.Reason)
+
+	// Handle 503 Service Unavailable — re-register and retry once
+	if res.StatusCode == 503 {
+		log.Printf("INVITE got 503, re-registering with PBX and retrying...")
+		if regErr := gw.registerSIP(); regErr != nil {
+			log.Printf("Re-registration failed: %v", regErr)
+		} else {
+			log.Printf("Re-registered successfully, retrying INVITE")
+			res, err = gw.sipClient.Do(ctx, req)
+			if err != nil {
+				cancel()
+				return nil, fmt.Errorf("INVITE retry after 503: %w", err)
+			}
+			log.Printf("INVITE retry response: status=%d reason=%s", res.StatusCode, res.Reason)
+		}
+	}
 
 	// Handle 401/407 digest auth using gateway's registered credentials
 	if res.StatusCode == 401 || res.StatusCode == 407 {
