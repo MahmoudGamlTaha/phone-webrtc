@@ -49,6 +49,8 @@ import (
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/gorilla/websocket"
+	"github.com/pion/ice/v4"
+	"github.com/pion/logging"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 )
@@ -143,6 +145,9 @@ type gateway struct {
 	sipUA     *sipgo.UserAgent
 	sipClient *sipgo.Client
 	sipServer *sipgo.Server
+
+	// WebRTC ICE UDP mux (shared across all PeerConnections)
+	iceUDPMux *ice.UDPMuxDefault
 }
 
 func newGateway() *gateway {
@@ -218,12 +223,29 @@ func main() {
 	log.Printf("SIP server: %s:%d", *sipDomain, sipServerPort)
 	log.Printf("RTP port range: %d-%d (open these UDP ports on firewall!)", *rtpPortMin, *rtpPortMax)
 
+	// Create shared ICE UDP mux for WebRTC on a dedicated port after the RTP range.
+	// This ensures all PeerConnections use a port that's open on the VPS firewall.
+	webrtcICEPort := *rtpPortMax + 1
+	iceConn, iceErr := net.ListenUDP("udp", &net.UDPAddr{
+		IP:   net.ParseIP("0.0.0.0"),
+		Port: webrtcICEPort,
+	})
+	if iceErr != nil {
+		log.Fatalf("Failed to create ICE UDP listener on port %d: %v", webrtcICEPort, iceErr)
+	}
+	sharedIceMux := ice.NewUDPMuxDefault(ice.UDPMuxParams{
+		Logger:  logging.NewDefaultLoggerFactory().NewLogger("ice-mux"),
+		UDPConn: iceConn,
+	})
+	log.Printf("WebRTC ICE UDP mux listening on port %d (open this UDP port on firewall!)", webrtcICEPort)
+
 	// Initialize database
 	if err := initDB(*dbPath); err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 
 	gw := newGateway()
+	gw.iceUDPMux = sharedIceMux
 
 	// Create a shared SIP UA (client + server use same socket/port)
 	var err error
@@ -1161,12 +1183,16 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Configure SettingEngine to advertise public IP in ICE candidates.
-	// Without this, Pion only advertises local interface IPs which may be
-	// private (10.x, 172.x, 192.x) on some VPS providers, causing ICE failure.
+	// Configure SettingEngine:
+	// 1. Advertise public IP in ICE candidates (VPS may have private interface IPs)
+	// 2. Use shared ICE UDP mux on a known-open port (created at startup)
+	// Without this, Pion picks random UDP ports that the VPS firewall blocks → ICE failed.
 	se := webrtc.SettingEngine{}
 	if *publicIP != "" {
 		se.SetNAT1To1IPs([]string{*publicIP}, webrtc.ICECandidateTypeHost)
+	}
+	if gw.iceUDPMux != nil {
+		se.SetICEUDPMux(gw.iceUDPMux)
 	}
 
 	// Create API with custom MediaEngine and SettingEngine
