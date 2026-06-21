@@ -274,15 +274,10 @@
         log('WARNING: Microphone not available - page must be served over HTTPS for mic access', 'error');
       }
 
-      // Create PeerConnection with PCMU-only codec to match SIP/PBX
+      // Create PeerConnection
       pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-        sdpSemantics: 'unified-plan'
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
       });
-
-      // Add a single sendrecv audio transceiver for bidirectional audio
-      // The server will ReplaceTrack with the SIP audio track when a call starts
-      pc.addTransceiver('audio', { direction: 'sendrecv' });
 
       // Get local audio (microphone) for sendrecv
       const micPromise = hasMic
@@ -293,31 +288,11 @@
           if (stream) {
             localStream = stream;
             log('Got microphone access', 'connected');
-            // Replace the sender track on the existing transceiver (not addTrack which creates a second m-line)
-            const sender = pc.getSenders()[0];
-            if (sender) {
-              stream.getTracks().forEach(track => sender.replaceTrack(track));
-              log('Replaced sender track with microphone', 'connected');
-            }
+            // Add local audio track — creates a sendrecv transceiver
+            stream.getTracks().forEach(track => pc.addTrack(track, stream));
           } else {
             log('No microphone - receive only mode', 'error');
-            // Switch the transceiver to recvonly
-            pc.getTransceivers()[0].direction = 'recvonly';
-          }
-
-          // Force PCMU codec to match SIP/PBX (gateway only supports PCMU)
-          const transceivers = pc.getTransceivers();
-          for (const t of transceivers) {
-            if (t.receiver && t.receiver.track && t.receiver.track.kind === 'audio') {
-              const codecs = t.receiver.getParameters().codecs || [];
-              const pcmuCodecs = codecs.filter(c => c.mimeType === 'audio/PCMU');
-              if (pcmuCodecs.length > 0) {
-                t.setCodecPreferences(pcmuCodecs);
-                log('Forced PCMU codec preference', 'connected');
-              } else {
-                log('WARNING: No PCMU codec available, codecs: ' + codecs.map(c => c.mimeType).join(','), 'error');
-              }
-            }
+            pc.addTransceiver('audio', { direction: 'recvonly' });
           }
 
           pc.oniceconnectionstatechange = () => {
@@ -334,7 +309,9 @@
 
           pc.ontrack = (event) => {
             log('Got remote audio track', 'call');
-            document.getElementById('remoteAudio').srcObject = event.streams[0];
+            const audio = document.getElementById('remoteAudio');
+            audio.srcObject = event.streams[0];
+            audio.play().catch(() => {});
           };
 
           // Send ICE candidates to server

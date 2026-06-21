@@ -1378,6 +1378,14 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 		return
 	}
 
+	// Re-register with PBX before each call to prevent 503 (expired registration)
+	// This is a lightweight operation if already registered
+	if err := gw.registerSIP(); err != nil {
+		log.Printf("Pre-dial SIP registration failed: %v (attempting call anyway)", err)
+	} else {
+		log.Printf("Pre-dial SIP registration confirmed")
+	}
+
 	// Create call log in DB
 	callLogID, err := createCallLog(peer.agentID, customerID, extension, "outbound")
 	if err != nil {
