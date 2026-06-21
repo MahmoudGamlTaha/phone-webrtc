@@ -121,6 +121,7 @@ type peerState struct {
 	pc                 *webrtc.PeerConnection
 	call               *sipCall
 	browserTrack       *webrtc.TrackRemote // Browser's outgoing audio track (mic)
+	trackFwdRunning    bool                // True when persistent browser→SIP forwarder is active
 	negotiateMu        sync.Mutex          // Prevents concurrent renegotiation
 	negotiating        bool                // True when an offer/answer exchange is in progress
 	pendingRenegotiate bool                // True if renegotiation was requested while already negotiating
@@ -455,6 +456,17 @@ func (gw *gateway) dialSIP(targetExtension string, localRTPPort int, agentExt, a
 		return nil, fmt.Errorf("INVITE failed with status %d %s", res.StatusCode, res.Reason)
 	}
 
+	// Log session timer headers from 200 OK (PBX may require periodic refresh)
+	for _, h := range res.GetHeaders("Session-Expires") {
+		log.Printf("Session-Expires: %s", h.Value())
+	}
+	for _, h := range res.GetHeaders("Require") {
+		log.Printf("Require: %s", h.Value())
+	}
+	for _, h := range res.GetHeaders("Min-SE") {
+		log.Printf("Min-SE: %s", h.Value())
+	}
+
 	// Send ACK for 2xx (must use res.To() with remote tag, route to Contact URI from 200 OK)
 	// For 2xx ACK, the Request-URI should be the Contact URI from the 200 OK response
 	ackReqURI := reqURI // default
@@ -768,17 +780,37 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 	}
 }
 
-// forwardTrackToRTP reads RTP packets from a WebRTC remote track and sends them to the SIP remote RTP address
-// Uses call.remoteAddr (latched) if available, otherwise falls back to SDP address
-func forwardTrackToRTP(track *webrtc.TrackRemote, call *sipCall) {
-	log.Printf("WebRTC→SIP forwarder started (trackID=%s, sdpAddr=%v, remoteAddr=%v)", track.ID(), call.sdpAddr, call.remoteAddr)
+// forwardBrowserTrack is a persistent goroutine that reads RTP packets from the
+// browser's audio track and forwards them to the current SIP call's RTP address.
+// Only ONE goroutine reads from the track — when the call ends, packets are dropped
+// until a new call starts. This avoids race conditions between calls.
+func (gw *gateway) forwardBrowserTrack(peer *peerState, track *webrtc.TrackRemote) {
+	log.Printf("Browser→SIP forwarder started (trackID=%s)", track.ID())
 	buff := make([]byte, 1500)
 	pktCount := 0
+	dropCount := 0
+
 	for {
 		n, _, err := track.Read(buff)
 		if err != nil {
-			log.Printf("WebRTC track read error: %v", err)
+			log.Printf("Browser track read error: %v", err)
+			gw.mu.Lock()
+			peer.trackFwdRunning = false
+			gw.mu.Unlock()
 			return
+		}
+
+		// Get current call (may change between calls)
+		gw.mu.RLock()
+		call := peer.call
+		gw.mu.RUnlock()
+
+		if call == nil || call.rtpConn == nil {
+			dropCount++
+			if dropCount <= 3 || dropCount%100 == 0 {
+				log.Printf("Browser→SIP: dropping pkt (no active call, %d dropped so far)", dropCount)
+			}
+			continue
 		}
 
 		// Use latched address if available, otherwise fall back to SDP address
@@ -788,17 +820,16 @@ func forwardTrackToRTP(track *webrtc.TrackRemote, call *sipCall) {
 		}
 
 		pktCount++
+		dropCount = 0
 		if pktCount <= 5 || pktCount%500 == 0 {
-			log.Printf("WebRTC→SIP: pkt #%d, %d bytes to %s (latched=%v, sdpAddr=%v)", pktCount, n, dest, call.latched, call.sdpAddr)
+			log.Printf("Browser→SIP: pkt #%d, %d bytes to %s (latched=%v)", pktCount, n, dest, call.latched)
 		}
 
 		if dest != nil {
 			if _, err := call.rtpConn.WriteToUDP(buff[:n], dest); err != nil {
-				log.Printf("RTP write error: %v", err)
-				return
+				// Write error — call likely ended, don't exit, just drop
+				// The persistent goroutine will pick up the next call automatically
 			}
-		} else {
-			log.Printf("WebRTC→SIP: dropping pkt #%d, no remote address (no SDP addr, not latched yet)", pktCount)
 		}
 	}
 }
@@ -1167,16 +1198,18 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Handle incoming audio track from browser (for outbound calls)
-	// Store the track on peerState so handleDial can start forwarding when the call is established
+	// Start a SINGLE persistent goroutine that reads from the track and forwards
+	// to whatever peer.call is currently active. This avoids race conditions where
+	// multiple goroutines read from the same TrackRemote between calls.
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		log.Printf("Got remote audio track from browser: Kind=%s, ID=%s, SSRC=%d", track.Kind(), track.ID(), track.SSRC())
 
 		gw.mu.Lock()
 		if p, ok := gw.peers[safeWS]; ok {
 			p.browserTrack = track
-			// If call already active, start forwarding immediately
-			if p.call != nil && p.call.rtpConn != nil {
-				go forwardTrackToRTP(track, p.call)
+			if !p.trackFwdRunning {
+				p.trackFwdRunning = true
+				go gw.forwardBrowserTrack(p, track)
 			}
 		}
 		gw.mu.Unlock()
@@ -1442,14 +1475,9 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 		}
 	}
 
-	// Start browser→SIP forwarding if we have the browser's track
-	gw.mu.Lock()
-	if peer.browserTrack != nil {
-		go forwardTrackToRTP(peer.browserTrack, call)
-	} else {
-		log.Printf("WARNING: no browserTrack yet for peer, browser→SIP audio will start when track arrives")
-	}
-	gw.mu.Unlock()
+	// Browser→SIP forwarding is handled by the persistent forwardBrowserTrack goroutine
+	// (started in OnTrack). It reads from the browser track and forwards to peer.call.
+	// No need to start a new goroutine here — just setting peer.call above is enough.
 
 	ws.WriteJSON(wsMessage{Event: "call-started", Data: extension})
 	log.Printf("Outbound call to %s established for agent %d", extension, peer.agentID)
