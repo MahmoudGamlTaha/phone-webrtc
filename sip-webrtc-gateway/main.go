@@ -1161,8 +1161,16 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create API with custom MediaEngine
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+	// Configure SettingEngine to advertise public IP in ICE candidates.
+	// Without this, Pion only advertises local interface IPs which may be
+	// private (10.x, 172.x, 192.x) on some VPS providers, causing ICE failure.
+	se := webrtc.SettingEngine{}
+	if *publicIP != "" {
+		se.SetNAT1To1IPs([]string{*publicIP}, webrtc.ICECandidateTypeHost)
+	}
+
+	// Create API with custom MediaEngine and SettingEngine
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithSettingEngine(se))
 
 	// Create PCMU-only PeerConnection
 	pc, err := api.NewPeerConnection(webrtc.Configuration{
@@ -1194,6 +1202,8 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		if candidate == nil {
 			return
 		}
+		log.Printf("ICE candidate: %s:%d (protocol=%s)",
+			candidate.Address, candidate.Port, candidate.Protocol)
 		candidateJSON, err := json.Marshal(candidate.ToJSON())
 		if err != nil {
 			log.Printf("Failed to marshal ICE candidate: %v", err)
