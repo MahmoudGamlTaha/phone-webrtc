@@ -51,6 +51,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pion/ice/v4"
 	"github.com/pion/logging"
+	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 )
@@ -91,10 +92,10 @@ var (
 
 // sipCall represents an active SIP call with its RTP connections
 type sipCall struct {
-	rtpConn    *net.UDPConn                // Local RTP listener
-	remoteAddr *net.UDPAddr                // Remote RTP address (latched from actual incoming packets)
-	sdpAddr    *net.UDPAddr                // Remote RTP address from SDP (initial target for keepalive)
-	audioTrack *webrtc.TrackLocalStaticRTP // Track for SIP→WebRTC direction
+	rtpConn    *net.UDPConn // Local RTP listener
+	rtpMu      sync.Mutex   // Guards remoteAddr and latched (written by reader goroutine, read by writer goroutine)
+	remoteAddr *net.UDPAddr // Remote RTP address (latched from actual incoming packets)
+	sdpAddr    *net.UDPAddr // Remote RTP address from SDP (initial target for keepalive)
 	callID     string
 	from       string
 	to         string
@@ -122,11 +123,22 @@ type peerState struct {
 	ws                 *threadSafeWriter
 	pc                 *webrtc.PeerConnection
 	call               *sipCall
-	browserTrack       *webrtc.TrackRemote // Browser's outgoing audio track (mic)
-	trackFwdRunning    bool                // True when persistent browser→SIP forwarder is active
-	negotiateMu        sync.Mutex          // Prevents concurrent renegotiation
-	negotiating        bool                // True when an offer/answer exchange is in progress
-	pendingRenegotiate bool                // True if renegotiation was requested while already negotiating
+	browserTrack       *webrtc.TrackRemote         // Browser's outgoing audio track (mic); may be replaced on renegotiation
+	sipTrack           *webrtc.TrackLocalStaticRTP // Persistent SIP→browser track (lives for the whole connection)
+	negotiateMu        sync.Mutex                  // Prevents concurrent renegotiation
+	negotiating        bool                        // True when an offer/answer exchange is in progress
+	pendingRenegotiate bool                        // True if renegotiation was requested while already negotiating
+
+	// RTP rewriting state for SIP→browser audio. The browser keeps a single SSRC
+	// for the whole connection, so sequence numbers and timestamps must stay
+	// continuous across consecutive SIP calls or the jitter buffer drops audio.
+	rtpMu     sync.Mutex
+	rtpInit   bool
+	srcSSRC   uint32 // SSRC of the current SIP RTP stream
+	seqOffset uint16
+	tsOffset  uint32
+	nextSeq   uint16 // Next sequence number to hand out after current stream
+	nextTs    uint32 // Last timestamp written
 
 	// CRM fields
 	agentID      int64  // Logged-in agent ID
@@ -659,34 +671,12 @@ func (gw *gateway) onSIPInvite(req *sip.Request, tx sip.ServerTransaction) {
 	// Parse remote SDP to get RTP address
 	remoteAddr, _ := parseSDPConnection(req.Body())
 
-	// Sanitize callID for use in SDP (remove spaces, colons, etc.)
-	safeCallID := strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
-			return r
-		}
-		return '-'
-	}, strings.TrimPrefix(callID, "Call-ID: "))
-
-	// Create audio track for SIP→WebRTC direction
-	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU},
-		fmt.Sprintf("sip-in-%s", safeCallID),
-		"pion-sip",
-	)
-	if err != nil {
-		log.Printf("Failed to create audio track: %v", err)
-		rtpConn.Close()
-		tx.Respond(sip.NewResponseFromRequest(req, 500, "Internal Server Error", nil))
-		return
-	}
-
 	call := &sipCall{
 		rtpConn:    rtpConn,
 		sdpAddr:    remoteAddr,
 		remoteAddr: remoteAddr, // initial target, will be updated by RTP latching
 		from:       from,
 		callID:     callID,
-		audioTrack: audioTrack,
 	}
 
 	// Store the call
@@ -694,16 +684,13 @@ func (gw *gateway) onSIPInvite(req *sip.Request, tx sip.ServerTransaction) {
 	gw.calls[callID] = call
 	gw.mu.Unlock()
 
-	// Forward RTP packets from SIP to the audio track
+	// Forward RTP packets from SIP to the browsers' persistent audio tracks
 	ctx, cancel := context.WithCancel(context.Background())
 	call.cancelFunc = cancel
 	go gw.forwardRTPToTrack(ctx, call)
 
 	// Send call-started event to all connected browsers
 	gw.broadcastToPeers(wsMessage{Event: "call-started", Data: from})
-
-	// Add the audio track to all connected WebRTC peers
-	gw.addTrackToAllPeers(audioTrack)
 
 	// Generate SDP answer for the SIP INVITE
 	sdpAnswer := generateSDPAnswer(req.Body(), *publicIP, rtpPort)
@@ -773,12 +760,14 @@ func startRTPListener() (*net.UDPConn, int, error) {
 	return nil, 0, fmt.Errorf("no available RTP ports in range %d-%d", min, max)
 }
 
-// forwardRTPToTrack reads RTP packets from SIP and writes them to the WebRTC audio track
+// forwardRTPToTrack reads RTP packets from SIP and writes them to the persistent
+// per-peer WebRTC audio tracks with sequence/timestamp rewriting.
 // Implements RTP latching: updates remoteAddr from actual incoming packet source (handles NAT)
 func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 	log.Printf("SIP→WebRTC forwarder started for call %s (sdpAddr=%v, rtpConn=%v)", call.callID, call.sdpAddr, call.rtpConn)
 	buff := make([]byte, 1500)
 	pktCount := 0
+	var pkt rtp.Packet
 	for {
 		select {
 		case <-ctx.Done():
@@ -803,10 +792,21 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 		}
 
 		// RTP latching: use actual source address as destination for outgoing RTP
+		call.rtpMu.Lock()
 		if !call.latched {
 			call.latched = true
 			call.remoteAddr = addr
 			log.Printf("RTP latched: remoteAddr updated to %s (was SDP addr %s)", addr, call.sdpAddr)
+		}
+		call.rtpMu.Unlock()
+
+		if err := pkt.Unmarshal(buff[:n]); err != nil {
+			continue // not a valid RTP packet
+		}
+		// Only forward PCMU media (PT 0). Skip comfort noise, DTMF events and
+		// empty keepalive probes — re-stamping them as PCMU causes audio glitches.
+		if pkt.PayloadType != 0 || len(pkt.Payload) == 0 {
+			continue
 		}
 
 		pktCount++
@@ -814,9 +814,57 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 			log.Printf("SIP→WebRTC: pkt #%d, %d bytes from %s", pktCount, n, addr)
 		}
 
-		if _, err := call.audioTrack.Write(buff[:n]); err != nil {
-			log.Printf("Audio track write error for call %s: %v", call.callID, err)
-			return
+		gw.writeRTPToPeers(call, &pkt)
+	}
+}
+
+// writeRTPToPeers routes a SIP RTP packet to the appropriate browser peers.
+// Outbound calls go only to the peer that owns the call; inbound calls are
+// broadcast to peers that are not busy with a different call.
+func (gw *gateway) writeRTPToPeers(call *sipCall, pkt *rtp.Packet) {
+	gw.mu.RLock()
+	defer gw.mu.RUnlock()
+
+	for _, peer := range gw.peers {
+		if call.isOutbound {
+			if peer.call != call {
+				continue
+			}
+		} else if peer.call != nil && peer.call != call {
+			continue // peer is busy with another call
+		}
+		peer.writeSIPRTP(pkt)
+	}
+}
+
+// writeSIPRTP writes a SIP RTP packet to this peer's persistent audio track,
+// rewriting sequence numbers and timestamps so they stay continuous across
+// consecutive SIP calls (the browser sees a single SSRC for the whole session).
+func (p *peerState) writeSIPRTP(pkt *rtp.Packet) {
+	p.rtpMu.Lock()
+	if !p.rtpInit {
+		p.rtpInit = true
+		p.srcSSRC = pkt.SSRC
+		p.seqOffset = 0
+		p.tsOffset = 0
+	} else if pkt.SSRC != p.srcSSRC {
+		// New SIP RTP stream (new call): splice it onto the previous stream so the
+		// browser's jitter buffer keeps accepting packets without a seq/ts jump.
+		p.srcSSRC = pkt.SSRC
+		p.seqOffset = p.nextSeq - pkt.SequenceNumber
+		p.tsOffset = p.nextTs + 160 - pkt.Timestamp // 160 = one 20ms PCMU frame @8kHz
+	}
+	out := *pkt
+	out.SequenceNumber = pkt.SequenceNumber + p.seqOffset
+	out.Timestamp = pkt.Timestamp + p.tsOffset
+	p.nextSeq = out.SequenceNumber + 1
+	p.nextTs = out.Timestamp
+	track := p.sipTrack
+	p.rtpMu.Unlock()
+
+	if track != nil {
+		if err := track.WriteRTP(&out); err != nil && err != io.ErrClosedPipe {
+			log.Printf("Audio track write error: %v", err)
 		}
 	}
 }
@@ -826,7 +874,7 @@ func (gw *gateway) forwardRTPToTrack(ctx context.Context, call *sipCall) {
 // Only ONE goroutine reads from the track — when the call ends, packets are dropped
 // until a new call starts. This avoids race conditions between calls.
 func (gw *gateway) forwardBrowserTrack(peer *peerState, track *webrtc.TrackRemote) {
-	log.Printf("Browser→SIP forwarder started (trackID=%s)", track.ID())
+	log.Printf("Browser→SIP forwarder started (trackID=%s, SSRC=%d)", track.ID(), track.SSRC())
 	buff := make([]byte, 1500)
 	pktCount := 0
 	dropCount := 0
@@ -834,17 +882,22 @@ func (gw *gateway) forwardBrowserTrack(peer *peerState, track *webrtc.TrackRemot
 	for {
 		n, _, err := track.Read(buff)
 		if err != nil {
-			log.Printf("Browser track read error: %v", err)
-			gw.mu.Lock()
-			peer.trackFwdRunning = false
-			gw.mu.Unlock()
+			log.Printf("Browser track read error (trackID=%s): %v", track.ID(), err)
 			return
 		}
 
-		// Get current call (may change between calls)
+		// Get current call and track (may change between calls / renegotiations)
 		gw.mu.RLock()
 		call := peer.call
+		currentTrack := peer.browserTrack
 		gw.mu.RUnlock()
+
+		// A newer browser track replaced this one (renegotiation) — exit so the
+		// forwarder for the new track is the only one sending to SIP.
+		if currentTrack != track {
+			log.Printf("Browser→SIP forwarder exiting: track superseded (trackID=%s)", track.ID())
+			return
+		}
 
 		if call == nil || call.rtpConn == nil {
 			dropCount++
@@ -855,7 +908,10 @@ func (gw *gateway) forwardBrowserTrack(peer *peerState, track *webrtc.TrackRemot
 		}
 
 		// Use latched address if available, otherwise fall back to SDP address
+		call.rtpMu.Lock()
 		dest := call.remoteAddr
+		latched := call.latched
+		call.rtpMu.Unlock()
 		if dest == nil {
 			dest = call.sdpAddr
 		}
@@ -863,13 +919,14 @@ func (gw *gateway) forwardBrowserTrack(peer *peerState, track *webrtc.TrackRemot
 		pktCount++
 		dropCount = 0
 		if pktCount <= 5 || pktCount%500 == 0 {
-			log.Printf("Browser→SIP: pkt #%d, %d bytes to %s (latched=%v)", pktCount, n, dest, call.latched)
+			log.Printf("Browser→SIP: pkt #%d, %d bytes to %s (latched=%v)", pktCount, n, dest, latched)
 		}
 
 		if dest != nil {
 			if _, err := call.rtpConn.WriteToUDP(buff[:n], dest); err != nil {
 				// Write error — call likely ended, don't exit, just drop
 				// The persistent goroutine will pick up the next call automatically
+				continue
 			}
 		}
 	}
@@ -898,56 +955,12 @@ func (gw *gateway) endCall(callID string) {
 		call.cancelFunc()
 	}
 
-	// Remove the audio track from all WebRTC peers
-	if call.audioTrack != nil {
-		gw.removeTrackFromAllPeers(call.audioTrack)
-	}
-
 	// Close the RTP connection
 	if call.rtpConn != nil {
 		call.rtpConn.Close()
 	}
 
 	log.Printf("SIP call ended: %s", callID)
-}
-
-// addTrackToAllPeers adds an audio track to every connected WebRTC PeerConnection
-func (gw *gateway) addTrackToAllPeers(track *webrtc.TrackLocalStaticRTP) {
-	gw.mu.RLock()
-	defer gw.mu.RUnlock()
-
-	for _, peer := range gw.peers {
-		senders := peer.pc.GetSenders()
-		if len(senders) > 0 {
-			if err := senders[0].ReplaceTrack(track); err != nil {
-				log.Printf("Failed to replace track on peer sender: %v", err)
-			}
-		} else {
-			if _, err := peer.pc.AddTrack(track); err != nil {
-				log.Printf("Failed to add track to peer: %v", err)
-				continue
-			}
-		}
-		gw.renegotiatePeer(peer)
-	}
-}
-
-// removeTrackFromAllPeers removes an audio track from every connected WebRTC PeerConnection
-func (gw *gateway) removeTrackFromAllPeers(track *webrtc.TrackLocalStaticRTP) {
-	gw.mu.RLock()
-	defer gw.mu.RUnlock()
-
-	for _, peer := range gw.peers {
-		for _, sender := range peer.pc.GetSenders() {
-			if sender.Track() != nil && sender.Track().ID() == track.ID() {
-				if err := peer.pc.RemoveTrack(sender); err != nil {
-					log.Printf("Failed to remove track from peer: %v", err)
-				}
-				gw.renegotiatePeer(peer)
-				break
-			}
-		}
-	}
 }
 
 // renegotiatePeer creates an offer and sends it to the WebRTC peer via WebSocket
@@ -1210,13 +1223,29 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer pc.Close()
 
-	// Add sendrecv audio transceiver - sender has nil track initially.
-	// handleDial will use ReplaceTrack to put the real SIP audio track on this sender.
-	// Browser also adds a sendrecv transceiver — unified-plan merges them into one m-line.
-	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+	// Add sendrecv audio transceiver with a PERSISTENT track that lives for the
+	// whole connection. All SIP calls write into this track (with seq/ts
+	// rewriting), so no per-call ReplaceTrack/renegotiation is needed — that
+	// caused broken audio on the second and later calls.
+	transceiver, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionSendrecv,
-	}); err != nil {
+	})
+	if err != nil {
 		log.Printf("Failed to add audio transceiver: %v", err)
+		return
+	}
+
+	sipTrack, err := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU, ClockRate: 8000, Channels: 1},
+		"sip-audio",
+		"pion-sip",
+	)
+	if err != nil {
+		log.Printf("Failed to create persistent SIP audio track: %v", err)
+		return
+	}
+	if err := transceiver.Sender().ReplaceTrack(sipTrack); err != nil {
+		log.Printf("Failed to attach persistent SIP track: %v", err)
 		return
 	}
 
@@ -1261,36 +1290,24 @@ func (gw *gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		gw.mu.Lock()
 		if p, ok := gw.peers[safeWS]; ok {
+			// Always adopt the newest track and start a forwarder for it.
+			// Any forwarder attached to a previous track exits on its own when it
+			// sees peer.browserTrack no longer matches (see forwardBrowserTrack).
 			p.browserTrack = track
-			if !p.trackFwdRunning {
-				p.trackFwdRunning = true
-				go gw.forwardBrowserTrack(p, track)
-			}
+			go gw.forwardBrowserTrack(p, track)
 		}
 		gw.mu.Unlock()
 	})
 
 	// Register the peer
-	peer := &peerState{ws: safeWS, pc: pc}
+	peer := &peerState{ws: safeWS, pc: pc, sipTrack: sipTrack}
 	gw.mu.Lock()
 	gw.peers[safeWS] = peer
-
-	// For existing inbound SIP calls, replace the generated track on the sender
-	for _, call := range gw.calls {
-		if call.audioTrack != nil {
-			senders := pc.GetSenders()
-			if len(senders) > 0 {
-				if err := senders[0].ReplaceTrack(call.audioTrack); err != nil {
-					log.Printf("Failed to replace track on new peer sender: %v", err)
-				}
-			}
-		}
-	}
 	gw.mu.Unlock()
 
 	// Send initial offer to browser so ICE can establish.
-	// The transceiver has a generated track (placeholder) - handleDial will
-	// ReplaceTrack with the real SIP audio track and renegotiate.
+	// The persistent SIP track is already attached — existing and future calls
+	// write into it directly, so this is the only negotiation needed.
 	gw.renegotiatePeer(peer)
 
 	// Main WebSocket read loop
@@ -1462,7 +1479,10 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 			for {
 				select {
 				case <-ticker.C:
-					if call.latched {
+					call.rtpMu.Lock()
+					latched := call.latched
+					call.rtpMu.Unlock()
+					if latched {
 						return // RTP flow established, no more keepalives needed
 					}
 					if _, err := rtpConn.WriteToUDP(keepalive, call.sdpAddr); err != nil {
@@ -1476,54 +1496,16 @@ func (gw *gateway) handleDial(ws *threadSafeWriter, peer *peerState, extension s
 		}()
 	}
 
-	// Sanitize callID for use in SDP (remove spaces, colons, etc.)
-	safeCallID := strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
-			return r
-		}
-		return '-'
-	}, strings.TrimPrefix(call.callID, "Call-ID: "))
-
-	// Create audio track for SIP→WebRTC direction
-	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU},
-		fmt.Sprintf("sip-out-%s", safeCallID),
-		"pion-sip-out",
-	)
-	if err != nil {
-		log.Printf("Failed to create outbound audio track: %v", err)
-		rtpConn.Close()
-		ws.WriteJSON(wsMessage{Event: "dial-error", Data: "Failed to create audio track"})
-		return
-	}
-	call.audioTrack = audioTrack
-
-	// Start forwarding RTP from SIP to WebRTC track
-	go gw.forwardRTPToTrack(ctx, call)
-
-	// Associate call with peer BEFORE ReplaceTrack+renegotiate so OnTrack can find it
+	// Associate call with peer BEFORE starting the forwarder so RTP routing
+	// (writeRTPToPeers) and the browser→SIP forwarder can find it immediately.
 	gw.mu.Lock()
 	peer.call = call
 	gw.mu.Unlock()
 
-	// Replace the track on the existing sendrecv transceiver's sender.
-	// First call: sender has nil track (from AddTransceiverFromKind on connect).
-	// Subsequent calls: sender has track from previous call.
-	// Using AddTrack would create a SECOND transceiver → two m-lines → broken audio.
-	senders := peer.pc.GetSenders()
-	if len(senders) > 0 {
-		if err := senders[0].ReplaceTrack(audioTrack); err != nil {
-			log.Printf("Failed to replace track on sender: %v", err)
-		} else {
-			log.Printf("Replaced sender track with SIP audio track (sendrecv)")
-		}
-	} else {
-		log.Printf("WARNING: no sender found, falling back to AddTrack")
-		if _, err := peer.pc.AddTrack(audioTrack); err != nil {
-			log.Printf("Failed to add outbound audio track: %v", err)
-		}
-	}
-	gw.renegotiatePeer(peer)
+	// Start forwarding RTP from SIP to the peer's persistent WebRTC track.
+	// No ReplaceTrack/renegotiation needed — the persistent track was attached
+	// at connection time and seq/ts rewriting keeps the stream continuous.
+	go gw.forwardRTPToTrack(ctx, call)
 
 	// Set CRM fields on call
 	call.callLogID = callLogID

@@ -57,10 +57,27 @@ export function connect() {
     }
   };
 
-  // Create WebRTC PeerConnection - backend is the offerer, we are the answerer
+  // Create WebRTC PeerConnection - backend is the offerer, we are the answerer.
+  // Close any previous PC first (reconnect case) and reset signaling state.
+  if (pc) {
+    try { pc.close(); } catch (e) { /* ignore */ }
+    pc = null;
+  }
+  iceCandidateQueue = [];
   pc = new RTCPeerConnection({
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
   });
+
+  // If we already have the mic (reconnect case), attach it to the NEW pc.
+  // ensureMicStream() returns early when localStream exists, so without this
+  // the new PeerConnection would never send mic audio (one-way audio).
+  if (localStream) {
+    const track = localStream.getAudioTracks()[0];
+    if (track) {
+      pc.addTrack(track, localStream);
+      console.log('connect: re-attached existing mic track to new PeerConnection');
+    }
+  }
 
   // Do NOT addTransceiver here - ensureMicStream uses addTrack instead, which
   // creates a transceiver with our mic track already attached. When the backend's
